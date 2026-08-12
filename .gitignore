@@ -1,0 +1,17 @@
+# 构建产物
+*.so
+*.h
+!cpagw-gateway.h
+
+# Python
+__pycache__/
+*.pyc
+
+# 编辑器
+.vscode/
+.idea/
+
+# 密钥/配置（绝不提交）
+*.key
+*.pem
+.env
