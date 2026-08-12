@@ -61,8 +61,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unsafe"
 )
 
@@ -70,8 +72,11 @@ const abiVersion uint32 = 1
 
 const (
 	pluginName    = "cpagw-gateway"
-	pluginVersion = "0.2.0"
+	pluginVersion = "0.3.0"
 	modelPrefix   = "cline-pass/"
+
+	failThresholdDefault = 2  // 连续失败多少次后触发 fallback
+	recoverStreakTarget  = 20 // 自动切换后连续成功多少次，自动恢复主力
 )
 
 // ---------- envelope / RPC 协议 ----------
@@ -104,6 +109,16 @@ type payloadResponse struct {
 	Body []byte `json:"Body"`
 }
 
+// request.complete 事件（RequestCompletion 的 JSON 子集，Go 默认字段名）
+type requestCompletion struct {
+	RequestID      string `json:"RequestID"`
+	Model          string `json:"Model"`
+	RequestedModel string `json:"RequestedModel"`
+	Outcome        string `json:"Outcome"`
+	StatusCode     int    `json:"StatusCode"`
+	Error          string `json:"Error"`
+}
+
 type managementRequest struct {
 	Method string              `json:"Method"`
 	Path   string              `json:"Path"`
@@ -119,14 +134,31 @@ type managementResponse struct {
 
 // ---------- 插件状态 ----------
 
+type fallbackEvent struct {
+	At     string `json:"at"`
+	From   string `json:"from,omitempty"`
+	To     string `json:"to,omitempty"`
+	Reason string `json:"reason"`
+}
+
+type pluginState struct {
+	Gateway       []string       `json:"gateway"`         // providerOptions.gateway.only 当前值（单值锁定）
+	Source        string         `json:"source"`          // state(手动) / auto(自动 fallback) / config / default
+	Fallbacks     []string       `json:"fallbacks"`       // fallback 链：链首为主力
+	FailThreshold int            `json:"fail_threshold"`  // 连续失败触发阈值
+	FailStreak    int            `json:"fail_streak"`     // 当前连续失败计数
+	SuccessStreak int            `json:"success_streak"`  // 自动切换后连续成功计数（满 recoverStreakTarget 恢复主力）
+	LastEvent     *fallbackEvent `json:"last_event,omitempty"`
+}
+
 var (
-	mu        sync.RWMutex
-	gateway   []string // providerOptions.gateway.only 候选
-	src       string   // 配置来源: state / config / default
-	statePath string
+	mu                 sync.RWMutex
+	st                 pluginState
+	statePath          string
+	fallbacksFromState bool // 运行时标记：state 文件是否显式提供过 fallbacks（优先于 config.yaml）
 )
 
-func defaultGateway() []string { return []string{"baseten"} }
+func defaultFallbacks() []string { return []string{"baseten", "togetherai", "fireworks"} }
 
 func stateFilePath() string {
 	// 状态文件放在 plugins 目录下（二进制 /CLIProxyAPI/CLIProxyAPI 的 dirname + plugins/）
@@ -147,32 +179,49 @@ func stateFilePath() string {
 func loadState() {
 	mu.Lock()
 	defer mu.Unlock()
-	gateway = defaultGateway()
-	src = "default"
-	sp := stateFilePath()
-	data, err := os.ReadFile(sp)
+	st = pluginState{
+		Gateway:       []string{"baseten"},
+		Source:        "default",
+		Fallbacks:     defaultFallbacks(),
+		FailThreshold: failThresholdDefault,
+	}
+	data, err := os.ReadFile(stateFilePath())
 	if err != nil {
 		return
 	}
-	var st struct {
-		Gateway []string `json:"gateway"`
+	var saved pluginState
+	if json.Unmarshal(data, &saved) != nil {
+		return
 	}
-	if json.Unmarshal(data, &st) == nil && len(st.Gateway) > 0 {
-		gateway = st.Gateway
-		src = "state"
+	if len(saved.Gateway) > 0 {
+		st.Gateway = saved.Gateway
+		st.Source = saved.Source
+		if st.Source == "" {
+			st.Source = "state"
+		}
 	}
+	if len(saved.Fallbacks) > 0 {
+		st.Fallbacks = saved.Fallbacks
+		fallbacksFromState = true
+	}
+	if saved.FailThreshold > 0 {
+		st.FailThreshold = saved.FailThreshold
+	}
+	st.FailStreak = saved.FailStreak
+	st.SuccessStreak = saved.SuccessStreak
+	st.LastEvent = saved.LastEvent
 }
 
-func persistState(gw []string) error {
+func persistState() error {
 	sp := stateFilePath()
-	data, _ := json.Marshal(map[string]any{"gateway": gw})
+	data, _ := json.Marshal(st)
 	if err := os.MkdirAll(filepath.Dir(sp), 0o755); err != nil {
 		return err
 	}
 	return os.WriteFile(sp, data, 0o644)
 }
 
-// applyConfig 解析 host 下发的 config_yaml（YAML 子集：gateway 列表）
+// applyConfig 解析 host 下发的 config_yaml（YAML 子集：gateway 列表 = 初始 fallback 链）
 func applyConfig(configYAML []byte) {
 	if len(configYAML) == 0 {
 		return
@@ -191,8 +240,14 @@ func applyConfig(configYAML []byte) {
 		return
 	}
 	mu.Lock()
-	gateway = gw
-	src = "config"
+	if !fallbacksFromState {
+		st.Fallbacks = gw
+	}
+	// 手动/自动切换优先；未干预时用 config 首项锁定
+	if st.Source != "state" && st.Source != "auto" {
+		st.Gateway = []string{gw[0]}
+		st.Source = "config"
+	}
 	mu.Unlock()
 }
 
@@ -209,10 +264,12 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		}
 		reg := `{"schema_version":1,"metadata":{"Name":"` + pluginName + `","Version":"` + pluginVersion +
 			`","Author":"Stabilize7440","GitHubRepository":"https://github.com/Stabilize7440/cpagw-gateway","ConfigFields":[]}` +
-			`,"capabilities":{"request_normalizer":true,"management_api":true}}`
+			`,"capabilities":{"request_normalizer":true,"request_lifecycle_plugin":true,"management_api":true}}`
 		return okEnvelopeJSON(reg)
 	case "request.normalize":
 		return normalizeRequest(request)
+	case "request.complete":
+		return handleRequestComplete(request)
 	case "management.register":
 		return okEnvelopeJSON(`{"resources":[` +
 			`{"Path":"/home","Menu":"ClinePass 网关","Description":"ClinePass 上游供应商选择与热切换"},` +
@@ -235,8 +292,8 @@ func normalizeRequest(request []byte) ([]byte, error) {
 	}
 	model := strings.TrimSpace(tr.Model)
 	mu.RLock()
-	gw := make([]string, len(gateway))
-	copy(gw, gateway)
+	gw := make([]string, len(st.Gateway))
+	copy(gw, st.Gateway)
 	mu.RUnlock()
 
 	if !strings.HasPrefix(model, modelPrefix) || len(tr.Body) == 0 || len(gw) == 0 {
@@ -260,6 +317,88 @@ func normalizeRequest(request []byte) ([]byte, error) {
 	return okEnvelopeJSON1(base64BodyJSON(newBody)), nil
 }
 
+// ---------- request.complete：被动 fallback（真实请求失败才切换） ----------
+
+func handleRequestComplete(request []byte) ([]byte, error) {
+	var rc requestCompletion
+	if err := json.Unmarshal(request, &rc); err != nil {
+		return okEnvelopeJSON1(`{}`), nil
+	}
+	if !strings.HasPrefix(strings.TrimSpace(rc.Model), modelPrefix) {
+		return okEnvelopeJSON1(`{}`), nil // 只关心 cline-pass 请求
+	}
+	switch rc.Outcome {
+	case "succeeded":
+		onRequestSucceeded()
+	case "failed":
+		// 5xx 或网络类错误（StatusCode==0 且带错误信息）视为上游故障；4xx/429 不切换
+		if rc.StatusCode >= 500 || (rc.StatusCode == 0 && rc.Error != "") {
+			onRequestFailed(rc.StatusCode, rc.Error)
+		}
+	}
+	return okEnvelopeJSON1(`{}`), nil
+}
+
+func onRequestSucceeded() {
+	mu.Lock()
+	defer mu.Unlock()
+	st.FailStreak = 0
+	if st.Source == "auto" && len(st.Fallbacks) > 0 && len(st.Gateway) == 1 && st.Gateway[0] != st.Fallbacks[0] {
+		st.SuccessStreak++
+		if st.SuccessStreak >= recoverStreakTarget {
+			from := st.Gateway[0]
+			st.Gateway = []string{st.Fallbacks[0]}
+			st.Source = "auto"
+			st.SuccessStreak = 0
+			st.LastEvent = &fallbackEvent{At: time.Now().Format(time.RFC3339), From: from, To: st.Fallbacks[0], Reason: "auto-recover (stable)"}
+			_ = persistState()
+		}
+		return
+	}
+	st.SuccessStreak = 0
+}
+
+func onRequestFailed(status int, errMsg string) {
+	mu.Lock()
+	defer mu.Unlock()
+	st.SuccessStreak = 0
+	st.FailStreak++
+	if st.FailStreak < st.FailThreshold || len(st.Fallbacks) < 2 {
+		return
+	}
+	cur := ""
+	if len(st.Gateway) > 0 {
+		cur = st.Gateway[0]
+	}
+	idx := -1
+	for i, f := range st.Fallbacks {
+		if f == cur {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 || idx >= len(st.Fallbacks)-1 {
+		return // 自定义上游或已在链尾：不再自动切
+	}
+	next := st.Fallbacks[idx+1]
+	reason := "HTTP " + strconv.Itoa(status)
+	if status == 0 {
+		reason = "network error"
+	}
+	if errMsg != "" {
+		if len(errMsg) > 120 {
+			errMsg = errMsg[:120]
+		}
+		reason += " " + errMsg
+	}
+	st.Gateway = []string{next}
+	st.Source = "auto"
+	st.FailStreak = 0
+	st.SuccessStreak = 0
+	st.LastEvent = &fallbackEvent{At: time.Now().Format(time.RFC3339), From: cur, To: next, Reason: reason}
+	_ = persistState()
+}
+
 // ---------- management.handle：配置 UI 的后端 ----------
 
 func handleManagement(request []byte) ([]byte, error) {
@@ -280,12 +419,48 @@ func handleManagement(request []byte) ([]byte, error) {
 	case mr.Method == "GET" && (path == "" || path == "/" || path == "/home"):
 		return htmlResp1(pageHTML()), nil
 	case mr.Method == "GET" && (path == "/config" || strings.HasSuffix(path, "/config")):
+		// 保存 fallbacks / 阈值（query 参数），然后返回完整状态
+		if raw := firstQuery(mr.Query, "fallbacks"); raw != "" {
+			parts := strings.Split(raw, ",")
+			fb := make([]string, 0, len(parts))
+			for _, p := range parts {
+				p = strings.TrimSpace(p)
+				if p != "" {
+					fb = append(fb, p)
+				}
+			}
+			if len(fb) > 0 {
+				mu.Lock()
+				st.Fallbacks = fb
+				fallbacksFromState = true
+				if len(st.Gateway) == 0 {
+					st.Gateway = []string{fb[0]}
+				}
+				mu.Unlock()
+				_ = persistState()
+			}
+		}
+		if raw := firstQuery(mr.Query, "threshold"); raw != "" {
+			if n, err := strconv.Atoi(raw); err == nil && n >= 1 && n <= 10 {
+				mu.Lock()
+				st.FailThreshold = n
+				mu.Unlock()
+				_ = persistState()
+			}
+		}
 		mu.RLock()
-		gw := make([]string, len(gateway))
-		copy(gw, gateway)
-		s := src
+		body, _ := json.Marshal(map[string]any{
+			"gateway":        st.Gateway,
+			"source":         st.Source,
+			"fallbacks":      st.Fallbacks,
+			"fail_threshold": st.FailThreshold,
+			"fail_streak":    st.FailStreak,
+			"success_streak": st.SuccessStreak,
+			"last_event":     st.LastEvent,
+			"plugin":         pluginName,
+			"version":        pluginVersion,
+		})
 		mu.RUnlock()
-		body, _ := json.Marshal(map[string]any{"gateway": gw, "source": s, "plugin": pluginName, "version": pluginVersion})
 		return jsonResp1(200, body), nil
 	case mr.Method == "GET" && (path == "/switch" || strings.HasSuffix(path, "/switch")):
 		raw := firstQuery(mr.Query, "gateway")
@@ -303,13 +478,15 @@ func handleManagement(request []byte) ([]byte, error) {
 		if len(gw) == 0 {
 			return errEnvelopeResp1(400, "empty gateway list"), nil
 		}
-		if err := persistState(gw); err != nil {
+		mu.Lock()
+		st.Gateway = gw
+		st.Source = "state" // 手动切换优先，自动 fallback 不再干预
+		st.FailStreak = 0
+		st.SuccessStreak = 0
+		mu.Unlock()
+		if err := persistState(); err != nil {
 			return errEnvelopeResp1(500, "persist failed: "+err.Error()), nil
 		}
-		mu.Lock()
-		gateway = gw
-		src = "state"
-		mu.Unlock()
 		body, _ := json.Marshal(map[string]any{"ok": true, "gateway": gw, "source": "state"})
 		return jsonResp1(200, body), nil
 	default:
@@ -448,6 +625,7 @@ func pageHTML() string {
   --primary-hover: var(--primary-hover, #6366f1);
   --danger: var(--danger-color, #ef4444);
   --ok: #10b981;
+  --warn: #f59e0b;
   --radius: var(--app-radius-md, 10px);
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -469,6 +647,7 @@ h1 { font-size: 17px; font-weight: 650; margin-bottom: 4px; }
   color: var(--primary); font-size: 12.5px; font-weight: 600;
 }
 .badge.src-state { background: color-mix(in srgb, var(--ok) 14%, transparent); color: var(--ok); }
+.badge.src-auto { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; margin-top: 10px; }
 .btn {
   border: 1px solid var(--border); background: var(--bg); color: var(--text);
@@ -500,18 +679,28 @@ code { background: var(--bg-muted); border: 1px solid var(--border); padding: 1p
 </head>
 <body>
 <h1>🔀 ClinePass 上游网关</h1>
-<div class="sub">cpagw-gateway v` + pluginVersion + ` · 注入 <code>providerOptions.gateway.only</code> · 切换立即生效</div>
+<div class="sub">cpagw-gateway v` + pluginVersion + ` · 注入 <code>providerOptions.gateway.only</code> · 上游故障自动 fallback</div>
 
 <div class="card">
   <div class="row">
-    <div><b>当前配置</b> <span id="src" class="badge">…</span></div>
+    <div><b>当前上游</b> <span id="src" class="badge">…</span></div>
     <div id="gw-badges"></div>
+  </div>
+  <div id="meta" class="sub" style="margin:8px 0 0 0">…</div>
+</div>
+
+<div class="card">
+  <div style="font-weight:600; margin-bottom:2px">Fallback 链（自动切换顺序）</div>
+  <div class="sub" style="margin-bottom:8px">当前上游连续失败 <code id="th">2</code> 次 → 自动切到下一个；自动切换后连续成功 20 次 → 自动恢复链首主力</div>
+  <div class="row">
+    <input id="fbs" type="text" placeholder="baseten, togetherai, fireworks">
+    <button class="action-btn" onclick="saveFallbacks()">保存</button>
   </div>
 </div>
 
 <div class="card">
   <div style="font-weight:600; margin-bottom:2px">快捷切换（单选）</div>
-  <div class="sub" style="margin-bottom:0">点击即生效 · 候选按顺序提交给网关动态选优，严格锁定请单选</div>
+  <div class="sub" style="margin-bottom:0">手动切换后自动 fallback 不再干预</div>
   <div class="grid" id="grid"></div>
 </div>
 
@@ -545,9 +734,19 @@ async function refresh() {
   try {
     const d = await api("/v0/resource/plugins/cpagw-gateway/config");
     current = d.gateway || [];
-    $("src").textContent = "来源: " + (d.source || "?");
-    $("src").className = "badge" + (d.source === "state" ? " src-state" : "");
+    const src = d.source || "?";
+    $("src").textContent = "来源: " + src;
+    $("src").className = "badge" + (src === "state" ? " src-state" : src === "auto" ? " src-auto" : "");
     $("gw-badges").innerHTML = current.map(function(g){return '<span class="badge">'+g+'</span>'}).join(" ");
+    $("fbs").value = (d.fallbacks || []).join(", ");
+    $("th").textContent = d.fail_threshold;
+    let meta = "连续失败 " + (d.fail_streak || 0) + " 次";
+    if (d.success_streak > 0) meta += " · 备胎已稳定 " + d.success_streak + " 次";
+    if (d.last_event) {
+      const e = d.last_event;
+      meta += " · 最近事件: " + e.from + " → " + e.to + "（" + e.reason + " " + e.at + "）";
+    }
+    $("meta").textContent = meta;
     $("custom").value = current.join(", ");
     renderGrid();
     show("已刷新", true);
@@ -580,6 +779,17 @@ async function applyCustom() {
     show("已应用 → " + (d.gateway || []).join(", "), true);
     refresh();
   } catch (e) { show("应用失败: " + e.message, false); }
+}
+
+async function saveFallbacks() {
+  const v = $("fbs").value.trim();
+  if (!v) { show("请输入 fallback 链", false); return; }
+  show("保存中…", true);
+  try {
+    await api("/v0/resource/plugins/cpagw-gateway/config?fallbacks=" + encodeURIComponent(v));
+    show("fallback 链已保存", true);
+    refresh();
+  } catch (e) { show("保存失败: " + e.message, false); }
 }
 
 refresh();
