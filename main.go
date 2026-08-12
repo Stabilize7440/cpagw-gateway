@@ -72,7 +72,7 @@ const abiVersion uint32 = 1
 
 const (
 	pluginName    = "cpagw-gateway"
-	pluginVersion = "0.3.0"
+	pluginVersion = "0.3.1"
 	modelPrefix   = "cline-pass/"
 
 	failThresholdDefault = 2  // 连续失败多少次后触发 fallback
@@ -720,9 +720,11 @@ code { background: var(--bg-muted); border: 1px solid var(--border); padding: 1p
 <script>
 const PROVIDERS = ["baseten","digitalocean","fireworks","modal","moonshotai","morph","nebius","togetherai"];
 let current = [];
+let busy = false;
 
 function $(id) { return document.getElementById(id); }
 function show(msg, ok) { const m = $("msg"); m.textContent = msg; m.className = ok ? "ok" : "err"; }
+function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':"&amp;",'<':"&lt;",'>':"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 
 async function api(path) {
   const r = await fetch(path, { cache: "no-store" });
@@ -730,14 +732,14 @@ async function api(path) {
   return r.json();
 }
 
-async function refresh() {
+async function refresh(silent) {
   try {
     const d = await api("/v0/resource/plugins/cpagw-gateway/config");
     current = d.gateway || [];
     const src = d.source || "?";
     $("src").textContent = "来源: " + src;
     $("src").className = "badge" + (src === "state" ? " src-state" : src === "auto" ? " src-auto" : "");
-    $("gw-badges").innerHTML = current.map(function(g){return '<span class="badge">'+g+'</span>'}).join(" ");
+    $("gw-badges").innerHTML = current.map(function(g){return '<span class="badge">'+esc(g)+'</span>'}).join(" ");
     $("fbs").value = (d.fallbacks || []).join(", ");
     $("th").textContent = d.fail_threshold;
     let meta = "连续失败 " + (d.fail_streak || 0) + " 次";
@@ -749,47 +751,56 @@ async function refresh() {
     $("meta").textContent = meta;
     $("custom").value = current.join(", ");
     renderGrid();
-    show("已刷新", true);
-  } catch (e) { show("加载失败: " + e.message, false); }
+    if (!silent) show("已刷新", true);
+  } catch (e) { if (!silent) show("加载失败: " + e.message, false); }
 }
 
 function renderGrid() {
   $("grid").innerHTML = PROVIDERS.map(p => {
     const active = current.length === 1 && current[0] === p;
-    return '<button class="btn'+(active?" active":"")+'" onclick="switchTo(\''+p+'\')">'+p+'</button>';
+    return '<button class="btn'+(active?" active":"")+'" onclick="switchTo(\''+esc(p)+'\')">'+esc(p)+'</button>';
   }).join("");
 }
 
 async function switchTo(p) {
+  if (busy) return;
+  busy = true;
   show("切换中…", true);
   try {
     const d = await api("/v0/resource/plugins/cpagw-gateway/switch?gateway=" + encodeURIComponent(p));
     current = d.gateway || [];
-    show("\u5df2\u5207\u6362 \u2192 " + current.join(", "), true);
-    refresh();
+    show("已切换 → " + current.join(", "), true);
+    refresh(true);
   } catch (e) { show("切换失败: " + e.message, false); }
+  finally { busy = false; }
 }
 
 async function applyCustom() {
   const v = $("custom").value.trim();
   if (!v) { show("请输入上游名称", false); return; }
+  if (busy) return;
+  busy = true;
   show("应用中…", true);
   try {
     const d = await api("/v0/resource/plugins/cpagw-gateway/switch?gateway=" + encodeURIComponent(v));
     show("已应用 → " + (d.gateway || []).join(", "), true);
-    refresh();
+    refresh(true);
   } catch (e) { show("应用失败: " + e.message, false); }
+  finally { busy = false; }
 }
 
 async function saveFallbacks() {
   const v = $("fbs").value.trim();
   if (!v) { show("请输入 fallback 链", false); return; }
+  if (busy) return;
+  busy = true;
   show("保存中…", true);
   try {
     await api("/v0/resource/plugins/cpagw-gateway/config?fallbacks=" + encodeURIComponent(v));
     show("fallback 链已保存", true);
-    refresh();
+    refresh(true);
   } catch (e) { show("保存失败: " + e.message, false); }
+  finally { busy = false; }
 }
 
 refresh();
