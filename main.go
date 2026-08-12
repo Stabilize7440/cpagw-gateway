@@ -58,12 +58,21 @@ import "C"
 import (
 	"encoding/base64"
 	"encoding/json"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"unsafe"
 )
 
 const abiVersion uint32 = 1
+
+const (
+	pluginName    = "cpagw-gateway"
+	pluginVersion = "0.2.0"
+	modelPrefix   = "cline-pass/"
+)
 
 // ---------- envelope / RPC 协议 ----------
 
@@ -78,13 +87,11 @@ type envelopeError struct {
 	Message string `json:"message"`
 }
 
-// rpcLifecycleRequest 与 CPA host 的 rpc_schema.go 对应（config_yaml 为 base64）
 type rpcLifecycleRequest struct {
 	ConfigYAML    []byte `json:"config_yaml"`
 	SchemaVersion uint32 `json:"schema_version"`
 }
 
-// RequestTransformRequest 与 sdk/pluginapi/types.go 对应
 type transformRequest struct {
 	FromFormat string `json:"FromFormat"`
 	ToFormat   string `json:"ToFormat"`
@@ -97,76 +104,130 @@ type payloadResponse struct {
 	Body []byte `json:"Body"`
 }
 
+type managementRequest struct {
+	Method string              `json:"Method"`
+	Path   string              `json:"Path"`
+	Query  map[string][]string `json:"Query"`
+	Body   []byte              `json:"Body"`
+}
+
+type managementResponse struct {
+	StatusCode int         `json:"StatusCode"`
+	Headers    http.Header `json:"Headers"`
+	Body       []byte      `json:"Body"`
+}
+
 // ---------- 插件状态 ----------
 
 var (
-	mu         sync.RWMutex
-	gateway    []string // providerOptions.gateway.only 的候选列表
-	cfgModel   string   // 匹配的模型前缀
+	mu        sync.RWMutex
+	gateway   []string // providerOptions.gateway.only 候选
+	src       string   // 配置来源: state / config / default
+	statePath string
 )
 
-const (
-	pluginName    = "cpagw-gateway"
-	pluginVersion = "0.1.0"
-	defaultModelPrefix = "cline-pass/"
-)
+func defaultGateway() []string { return []string{"baseten"} }
 
-// 默认配置：baseten 主力
-func setDefaultConfig() {
-	gateway = []string{"baseten"}
-	cfgModel = defaultModelPrefix
+func stateFilePath() string {
+	// 状态文件放在 plugins 目录下（二进制 /CLIProxyAPI/CLIProxyAPI 的 dirname + plugins/）
+	exe, err := os.Executable()
+	if err == nil && exe != "" {
+		dir := filepath.Dir(exe)
+		if strings.HasSuffix(dir, "plugins") || strings.HasSuffix(filepath.Base(dir), "plugins") {
+			return filepath.Join(dir, "cpagw-gateway-state.json")
+		}
+		if fi, err := os.Stat(filepath.Join(dir, "plugins")); err == nil && fi.IsDir() {
+			return filepath.Join(dir, "plugins", "cpagw-gateway-state.json")
+		}
+		return filepath.Join(dir, "plugins", "cpagw-gateway-state.json")
+	}
+	return "cpagw-gateway-state.json"
 }
 
-func handleMethod(method string, request []byte) ([]byte, error) {
-	switch method {
-	case "plugin.register", "plugin.reconfigure":
-		// 解析配置（reconfigure 时携带 config_yaml）
-		if method == "plugin.reconfigure" && len(request) > 0 {
-			var lr rpcLifecycleRequest
-			if err := json.Unmarshal(request, &lr); err == nil {
-				applyConfig(lr.ConfigYAML)
-			}
-		}
-		return okEnvelopeJSON(`{"schema_version":1,"metadata":{"Name":"` + pluginName + `","Version":"` + pluginVersion +
-			`","Author":"Stabilize7440","GitHubRepository":"https://github.com/router-for-me/CLIProxyAPI","ConfigFields":[]},"capabilities":{"request_normalizer":true}}`)
-	case "request.normalize":
-		return normalizeRequest(request)
-	default:
-		return errorEnvelope("unknown_method", "unknown method: "+method), nil
+func loadState() {
+	mu.Lock()
+	defer mu.Unlock()
+	gateway = defaultGateway()
+	src = "default"
+	sp := stateFilePath()
+	data, err := os.ReadFile(sp)
+	if err != nil {
+		return
+	}
+	var st struct {
+		Gateway []string `json:"gateway"`
+	}
+	if json.Unmarshal(data, &st) == nil && len(st.Gateway) > 0 {
+		gateway = st.Gateway
+		src = "state"
 	}
 }
 
-// applyConfig 解析 YAML 配置（gopkg.in/yaml.v3 风格，手动解析最小子集：gateway 列表）
+func persistState(gw []string) error {
+	sp := stateFilePath()
+	data, _ := json.Marshal(map[string]any{"gateway": gw})
+	if err := os.MkdirAll(filepath.Dir(sp), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(sp, data, 0o644)
+}
+
+// applyConfig 解析 host 下发的 config_yaml（YAML 子集：gateway 列表）
 func applyConfig(configYAML []byte) {
 	if len(configYAML) == 0 {
 		return
 	}
-	// config_yaml 是 YAML，例如：
-	//   enabled: true
-	//   priority: 0
-	//   gateway:
-	//     - baseten
-	//     - togetherai
-	// 手动解析 gateway 列表（缩进敏感，只支持简单结构）
-	lines := strings.Split(string(configYAML), "\n")
 	var gw []string
-	for _, line := range lines {
+	for _, line := range strings.Split(string(configYAML), "\n") {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "- ") && !strings.HasPrefix(trimmed, "--") {
+		if strings.HasPrefix(trimmed, "- ") {
 			item := strings.Trim(strings.TrimPrefix(trimmed, "- "), `"' `)
 			if item != "" && !strings.HasPrefix(item, "#") {
 				gw = append(gw, item)
 			}
 		}
 	}
-	mu.Lock()
-	if len(gw) > 0 {
-		gateway = gw
+	if len(gw) == 0 {
+		return
 	}
+	mu.Lock()
+	gateway = gw
+	src = "config"
 	mu.Unlock()
 }
 
-// normalizeRequest 处理 request.normalize：匹配 cline-pass/* 注入 providerOptions
+// ---------- 方法分发 ----------
+
+func handleMethod(method string, request []byte) ([]byte, error) {
+	switch method {
+	case "plugin.register", "plugin.reconfigure":
+		if method == "plugin.reconfigure" && len(request) > 0 {
+			var lr rpcLifecycleRequest
+			if json.Unmarshal(request, &lr) == nil {
+				applyConfig(lr.ConfigYAML)
+			}
+		}
+		reg := `{"schema_version":1,"metadata":{"Name":"` + pluginName + `","Version":"` + pluginVersion +
+			`","Author":"Stabilize7440","GitHubRepository":"https://github.com/Stabilize7440/cpagw-gateway","ConfigFields":[]}` +
+			`,"capabilities":{"request_normalizer":true,"management_api":true}}`
+		return okEnvelopeJSON(reg)
+	case "request.normalize":
+		return normalizeRequest(request)
+	case "management.register":
+		return okEnvelopeJSON(`{"resources":[` +
+			`{"Path":"/home","Menu":"ClinePass 网关","Description":"ClinePass 上游供应商选择与热切换"},` +
+			`{"Path":"/config","Description":"当前网关配置(JSON)"},` +
+			`{"Path":"/switch","Description":"切换上游: ?gateway=baseten[,togetherai]"}` +
+			`]}`)
+	case "management.handle":
+		return handleManagement(request)
+	default:
+		return errorEnvelope("unknown_method", "unknown method: "+method), nil
+	}
+}
+
+// ---------- request.normalize：注入 providerOptions ----------
+
 func normalizeRequest(request []byte) ([]byte, error) {
 	var tr transformRequest
 	if err := json.Unmarshal(request, &tr); err != nil {
@@ -174,17 +235,13 @@ func normalizeRequest(request []byte) ([]byte, error) {
 	}
 	model := strings.TrimSpace(tr.Model)
 	mu.RLock()
-	prefix := cfgModel
 	gw := make([]string, len(gateway))
 	copy(gw, gateway)
 	mu.RUnlock()
 
-	if !strings.HasPrefix(model, prefix) || len(tr.Body) == 0 || len(gw) == 0 {
-		// 不匹配或无需修改：原样返回
+	if !strings.HasPrefix(model, modelPrefix) || len(tr.Body) == 0 || len(gw) == 0 {
 		return okEnvelopeJSON1(base64BodyJSON(tr.Body)), nil
 	}
-
-	// 解析 OpenAI chat.completions body 并注入 providerOptions
 	var payload map[string]any
 	if err := json.Unmarshal(tr.Body, &payload); err != nil {
 		return okEnvelopeJSON1(base64BodyJSON(tr.Body)), nil
@@ -194,9 +251,7 @@ func normalizeRequest(request []byte) ([]byte, error) {
 		only[i] = g
 	}
 	payload["providerOptions"] = map[string]any{
-		"gateway": map[string]any{
-			"only": only,
-		},
+		"gateway": map[string]any{"only": only},
 	}
 	newBody, err := json.Marshal(payload)
 	if err != nil {
@@ -205,10 +260,92 @@ func normalizeRequest(request []byte) ([]byte, error) {
 	return okEnvelopeJSON1(base64BodyJSON(newBody)), nil
 }
 
-func okEnvelopeJSON1(result string) []byte {
-	raw, _ := json.Marshal(envelope{OK: true, Result: json.RawMessage(result)})
-	return raw
+// ---------- management.handle：配置 UI 的后端 ----------
+
+func handleManagement(request []byte) ([]byte, error) {
+	var mr managementRequest
+	if err := json.Unmarshal(request, &mr); err != nil {
+		return errEnvelopeResp1(400, "bad request"), nil
+	}
+	// host 传入的 Path 是完整 URL（如 /v0/resource/plugins/cpagw-gateway/home），剥离前缀后匹配
+	fullPath := strings.TrimRight(mr.Path, "/")
+	path := fullPath
+	if i := strings.Index(fullPath, "/cpagw-gateway"); i >= 0 {
+		path = fullPath[i+len("/cpagw-gateway"):]
+	}
+	if path == "" {
+		path = "/"
+	}
+	switch {
+	case mr.Method == "GET" && (path == "" || path == "/" || path == "/home"):
+		return htmlResp1(pageHTML()), nil
+	case mr.Method == "GET" && (path == "/config" || strings.HasSuffix(path, "/config")):
+		mu.RLock()
+		gw := make([]string, len(gateway))
+		copy(gw, gateway)
+		s := src
+		mu.RUnlock()
+		body, _ := json.Marshal(map[string]any{"gateway": gw, "source": s, "plugin": pluginName, "version": pluginVersion})
+		return jsonResp1(200, body), nil
+	case mr.Method == "GET" && (path == "/switch" || strings.HasSuffix(path, "/switch")):
+		raw := firstQuery(mr.Query, "gateway")
+		if raw == "" {
+			return errEnvelopeResp1(400, "missing gateway query parameter"), nil
+		}
+		parts := strings.Split(raw, ",")
+		gw := make([]string, 0, len(parts))
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				gw = append(gw, p)
+			}
+		}
+		if len(gw) == 0 {
+			return errEnvelopeResp1(400, "empty gateway list"), nil
+		}
+		if err := persistState(gw); err != nil {
+			return errEnvelopeResp1(500, "persist failed: "+err.Error()), nil
+		}
+		mu.Lock()
+		gateway = gw
+		src = "state"
+		mu.Unlock()
+		body, _ := json.Marshal(map[string]any{"ok": true, "gateway": gw, "source": "state"})
+		return jsonResp1(200, body), nil
+	default:
+		return errEnvelopeResp1(404, "not found"), nil
+	}
 }
+
+func firstQuery(q map[string][]string, key string) string {
+	if v, ok := q[key]; ok && len(v) > 0 {
+		return v[0]
+	}
+	return ""
+}
+
+func jsonResp1(status int, body []byte) []byte {
+	return okEnvelopeJSON1(rawEnvelope(status, "application/json; charset=utf-8", body))
+}
+
+func htmlResp1(html string) []byte {
+	return okEnvelopeJSON1(rawEnvelope(200, "text/html; charset=utf-8", []byte(html)))
+}
+
+func errEnvelopeResp1(status int, msg string) []byte {
+	return okEnvelopeJSON1(rawEnvelope(status, "application/json; charset=utf-8", []byte(`{"error":"`+msg+`"}`)))
+}
+
+func rawEnvelope(status int, contentType string, body []byte) string {
+	raw, _ := json.Marshal(managementResponse{
+		StatusCode: status,
+		Headers:    http.Header{"content-type": []string{contentType}},
+		Body:       body,
+	})
+	return string(raw)
+}
+
+// ---------- 工具 ----------
 
 func base64BodyJSON(body []byte) string {
 	return `{"Body":"` + base64.StdEncoding.EncodeToString(body) + `"}`
@@ -216,6 +353,11 @@ func base64BodyJSON(body []byte) string {
 
 func okEnvelopeJSON(result string) ([]byte, error) {
 	return json.Marshal(envelope{OK: true, Result: json.RawMessage(result)})
+}
+
+func okEnvelopeJSON1(result string) []byte {
+	raw, _ := json.Marshal(envelope{OK: true, Result: json.RawMessage(result)})
+	return raw
 }
 
 func errorEnvelope(code, message string) []byte {
@@ -243,7 +385,7 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 		return 1
 	}
 	C.store_host_api(host)
-	setDefaultConfig()
+	loadState()
 	plugin.abi_version = C.uint32_t(abiVersion)
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
 	plugin.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)
@@ -284,3 +426,164 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {}
+
+// ---------- 内嵌管理页面 ----------
+
+func pageHTML() string {
+	return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ClinePass 网关</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: var(--app-surface, #ffffff);
+  --bg-muted: var(--app-surface-muted, #f6f7f9);
+  --text: var(--app-text-primary, #1f2937);
+  --text-muted: var(--app-text-muted, #8b95a6);
+  --border: var(--app-border, rgba(15,23,42,0.10));
+  --primary: var(--primary-color, #4f46e5);
+  --primary-hover: var(--primary-hover, #6366f1);
+  --danger: var(--danger-color, #ef4444);
+  --ok: #10b981;
+  --radius: var(--app-radius-md, 10px);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font: 14px/1.6 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: var(--bg); color: var(--text);
+  padding: 20px; max-width: 680px; margin: 0 auto;
+}
+h1 { font-size: 17px; font-weight: 650; margin-bottom: 4px; }
+.sub { color: var(--text-muted); font-size: 12.5px; margin-bottom: 18px; }
+.card {
+  background: var(--bg-muted); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 14px 16px; margin-bottom: 14px;
+}
+.row { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.badge {
+  display: inline-block; padding: 2px 10px; border-radius: 999px;
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+  color: var(--primary); font-size: 12.5px; font-weight: 600;
+}
+.badge.src-state { background: color-mix(in srgb, var(--ok) 14%, transparent); color: var(--ok); }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; margin-top: 10px; }
+.btn {
+  border: 1px solid var(--border); background: var(--bg); color: var(--text);
+  border-radius: 8px; padding: 9px 10px; font-size: 13px; cursor: pointer;
+  transition: all .15s; text-align: center; word-break: break-all;
+}
+.btn:hover { border-color: var(--primary); color: var(--primary); }
+.btn.active {
+  background: var(--primary); border-color: var(--primary);
+  color: var(--primary-contrast, #fff); font-weight: 600;
+}
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+input[type=text] {
+  flex: 1; min-width: 200px; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg); color: var(--text); padding: 8px 10px; font-size: 13px;
+}
+input[type=text]:focus { outline: none; border-color: var(--primary); }
+.actions { display: flex; gap: 8px; margin-top: 10px; align-items: center; flex-wrap: wrap; }
+.action-btn {
+  border: none; background: var(--primary); color: var(--primary-contrast, #fff);
+  border-radius: 8px; padding: 8px 18px; font-size: 13px; font-weight: 600; cursor: pointer;
+}
+.action-btn:hover { background: var(--primary-hover); }
+.action-btn.ghost { background: transparent; color: var(--primary); border: 1px solid var(--primary); }
+#msg { font-size: 12.5px; min-height: 18px; }
+#msg.ok { color: var(--ok); } #msg.err { color: var(--danger); }
+code { background: var(--bg-muted); border: 1px solid var(--border); padding: 1px 6px; border-radius: 5px; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>🔀 ClinePass 上游网关</h1>
+<div class="sub">cpagw-gateway v` + pluginVersion + ` · 注入 <code>providerOptions.gateway.only</code> · 切换立即生效</div>
+
+<div class="card">
+  <div class="row">
+    <div><b>当前配置</b> <span id="src" class="badge">…</span></div>
+    <div id="gw-badges"></div>
+  </div>
+</div>
+
+<div class="card">
+  <div style="font-weight:600; margin-bottom:2px">快捷切换（单选）</div>
+  <div class="sub" style="margin-bottom:0">点击即生效 · 候选按顺序提交给网关动态选优，严格锁定请单选</div>
+  <div class="grid" id="grid"></div>
+</div>
+
+<div class="card">
+  <div style="font-weight:600; margin-bottom:8px">自定义候选（逗号分隔，多值 = 候选池）</div>
+  <div class="row">
+    <input id="custom" type="text" placeholder="例如: baseten, togetherai, fireworks">
+    <button class="action-btn" onclick="applyCustom()">应用</button>
+  </div>
+</div>
+
+<div class="actions">
+  <button class="action-btn ghost" onclick="refresh()">刷新</button>
+  <span id="msg"></span>
+</div>
+
+<script>
+const PROVIDERS = ["baseten","digitalocean","fireworks","modal","moonshotai","morph","nebius","togetherai"];
+let current = [];
+
+function $(id) { return document.getElementById(id); }
+function show(msg, ok) { const m = $("msg"); m.textContent = msg; m.className = ok ? "ok" : "err"; }
+
+async function api(path) {
+  const r = await fetch(path, { cache: "no-store" });
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.json();
+}
+
+async function refresh() {
+  try {
+    const d = await api("/v0/resource/plugins/cpagw-gateway/config");
+    current = d.gateway || [];
+    $("src").textContent = "来源: " + (d.source || "?");
+    $("src").className = "badge" + (d.source === "state" ? " src-state" : "");
+    $("gw-badges").innerHTML = current.map(function(g){return '<span class="badge">'+g+'</span>'}).join(" ");
+    $("custom").value = current.join(", ");
+    renderGrid();
+    show("已刷新", true);
+  } catch (e) { show("加载失败: " + e.message, false); }
+}
+
+function renderGrid() {
+  $("grid").innerHTML = PROVIDERS.map(p => {
+    const active = current.length === 1 && current[0] === p;
+    return '<button class="btn'+(active?" active":"")+'" onclick="switchTo(\''+p+'\')">'+p+'</button>';
+  }).join("");
+}
+
+async function switchTo(p) {
+  show("切换中…", true);
+  try {
+    const d = await api("/v0/resource/plugins/cpagw-gateway/switch?gateway=" + encodeURIComponent(p));
+    current = d.gateway || [];
+    show("\u5df2\u5207\u6362 \u2192 " + current.join(", "), true);
+    refresh();
+  } catch (e) { show("切换失败: " + e.message, false); }
+}
+
+async function applyCustom() {
+  const v = $("custom").value.trim();
+  if (!v) { show("请输入上游名称", false); return; }
+  show("应用中…", true);
+  try {
+    const d = await api("/v0/resource/plugins/cpagw-gateway/switch?gateway=" + encodeURIComponent(v));
+    show("已应用 → " + (d.gateway || []).join(", "), true);
+    refresh();
+  } catch (e) { show("应用失败: " + e.message, false); }
+}
+
+refresh();
+</script>
+</body>
+</html>`
+}
