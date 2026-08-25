@@ -132,7 +132,7 @@ python3 cpagw.py rules -d 'gpt-5*'         # 删除规则
 
 ## 已知限制
 
-- 上游可用性由 ClinePass 侧动态决定，实测（2026-08-26）：glm-5.3 目前仅 `zai` 可用；kimi-k3 实际恒由 togetherai(Together) 支撑；glm-5.2 覆盖 baseten/digitalocean/fireworks/morph/nebius/togetherai/zai。若某上游报 `No available providers match the 'only' filter`，完整错误体的 `Available providers are: ...` 会列出当前可选值（可能新增未知上游名，规则 API 不校验值，可直接使用）
+- 上游可用性由 ClinePass 侧动态决定。实测（2026-08-26）：glm-5.3 目前仅 `zai` 可用；kimi-k3 不校验 `only` 值（锁任何名字都放行）但实际恒由 togetherai(Together) 支撑；glm-5.2 的 ClinePass 路由表单为 18 个渠道（错误法枚举）：alibaba / baseten / crusoe / deepinfra / digitalocean / fireworks / friendli / gmicloud / inceptron / morph / nebius / novita / parasail / runware / streamlake / togetherai / wafer / zai，其中 11 个已实测连通。若某上游报 `No available providers match the 'only' filter`，完整错误体的 `Available providers are: ...` 会列出当前可选值（可能新增未知上游名，规则 API 不校验值，可直接使用）
 - ClinePass 网关的 `only` 多值语义是「候选池动态选优」（按实时延迟/健康加权），**不是顺序 fallback**；严格锁定请用单值
 - 插件配置变更通过 CPA 的配置热重载传播，Docker Desktop bind mount 下 Windows 侧直接改文件不触发 inotify，请走管理 API 或重启容器
 - `model_rules` 存入插件状态文件而非 config.yaml：状态文件由插件自身读写，与 CPA 配置热重载无关

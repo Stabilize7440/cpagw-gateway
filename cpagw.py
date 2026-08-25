@@ -30,8 +30,10 @@ PLUGIN_ID = "cpagw-gateway"
 DEFAULT_PANEL_KEY = os.environ.get("CPAMP_KEY", "")  # 必填：从环境变量提供
 
 VALID_PROVIDERS = [
-    "baseten", "digitalocean", "fireworks", "modal",
-    "moonshotai", "morph", "nebius", "togetherai", "zai",
+    "alibaba", "baseten", "crusoe", "deepinfra", "digitalocean",
+    "fireworks", "friendli", "gmicloud", "inceptron", "modal",
+    "moonshotai", "morph", "nebius", "novita", "parasail",
+    "runware", "streamlake", "togetherai", "wafer", "zai",
 ]
 
 
