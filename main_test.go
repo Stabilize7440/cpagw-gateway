@@ -236,3 +236,99 @@ func TestStatePersistenceKeepsRules(t *testing.T) {
 		t.Fatalf("legacy state broken: %v", st.Gateway)
 	}
 }
+
+func TestParseProvidersFromError(t *testing.T) {
+	full := `Failed to create stream: ... {"error":{"message":"No available providers match the 'only' filter: baseten. Available providers are: alibaba, baseten, crusoe, deepinfra, digitalocean","type":"invalid_request_error","param":{"modelId":"zai/glm-5.2"}}}`
+	got := parseProvidersFromError(full)
+	if len(got) != 5 || got[0] != "alibaba" || got[4] != "digitalocean" {
+		t.Fatalf("parse full error: %v", got)
+	}
+	// 列表在文本末尾（无尾引号）
+	got = parseProvidersFromError("Available providers are: zai, nebius")
+	if len(got) != 2 || got[1] != "nebius" {
+		t.Fatalf("parse tail list: %v", got)
+	}
+	// 无匹配
+	if got := parseProvidersFromError("some unrelated error"); got != nil {
+		t.Fatalf("should be nil: %v", got)
+	}
+	// 空文本
+	if got := parseProvidersFromError(""); got != nil {
+		t.Fatalf("empty should be nil: %v", got)
+	}
+}
+
+func TestProvidersManagementAPI(t *testing.T) {
+	orig := statePath
+	statePath = filepath.Join(t.TempDir(), "state.json")
+	defer func() { statePath = orig }()
+
+	mu.Lock()
+	st.ModelProviders = nil
+	mu.Unlock()
+
+	call := func(query map[string][]string) string {
+		mr := managementRequest{
+			Method: "GET", Path: "/v0/resource/plugins/cpagw-gateway/providers",
+			Query: query,
+		}
+		raw, _ := json.Marshal(mr)
+		out, _ := handleManagement(raw)
+		return decodeMgmt(t, out)
+	}
+
+	// 默认预置（无自定义时 merged 返回默认 3 模型）
+	body := call(nil)
+	if !strings.Contains(body, "glm-5.2") || !strings.Contains(body, "glm-5.3") || !strings.Contains(body, "kimi-k3") {
+		t.Fatalf("default providers missing: %s", body)
+	}
+	// 默认 glm-5.3 只有 zai
+	var resp struct {
+		Providers map[string][]string `json:"providers"`
+	}
+	if json.Unmarshal([]byte(body), &resp) != nil {
+		t.Fatal("bad providers response")
+	}
+	if len(resp.Providers["glm-5.3"]) != 1 || resp.Providers["glm-5.3"][0] != "zai" {
+		t.Fatalf("default glm-5.3: %v", resp.Providers["glm-5.3"])
+	}
+	// 自定义覆盖
+	call(map[string][]string{"model": {"glm-5.3"}, "providers": {"zai,wafer"}})
+	mu.RLock()
+	got := st.ModelProviders["glm-5.3"]
+	mu.RUnlock()
+	if len(got) != 2 || got[1] != "wafer" {
+		t.Fatalf("custom providers not stored: %v", got)
+	}
+	// 删除自定义 → 回默认
+	call(map[string][]string{"model": {"glm-5.3"}, "providers": {"-"}})
+	mu.RLock()
+	_, exists := st.ModelProviders["glm-5.3"]
+	mu.RUnlock()
+	if exists {
+		t.Fatal("custom providers not deleted")
+	}
+	body = call(nil)
+	var resp2 struct {
+		Providers map[string][]string `json:"providers"`
+	}
+	if json.Unmarshal([]byte(body), &resp2) != nil {
+		t.Fatal("bad providers response 2")
+	}
+	if len(resp2.Providers["glm-5.3"]) != 1 || resp2.Providers["glm-5.3"][0] != "zai" {
+		t.Fatalf("reset to default failed: %v", resp2.Providers["glm-5.3"])
+	}
+}
+
+func TestParseErrorEndpoint(t *testing.T) {
+	mr := managementRequest{
+		Method: "GET", Path: "/v0/resource/plugins/cpagw-gateway/parse-error",
+		Query: map[string][]string{"text": {"No available providers match the 'only' filter: x. Available providers are: zai, nebius"}},
+	}
+	raw, _ := json.Marshal(mr)
+	out, _ := handleManagement(raw)
+	body := decodeMgmt(t, out)
+	if !strings.Contains(body, "zai") || !strings.Contains(body, "nebius") {
+		t.Fatalf("parse-error endpoint failed: %s", body)
+	}
+}

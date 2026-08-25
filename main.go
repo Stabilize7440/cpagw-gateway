@@ -61,6 +61,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -72,7 +73,7 @@ const abiVersion uint32 = 1
 
 const (
 	pluginName    = "cpagw-gateway"
-	pluginVersion = "0.4.0"
+	pluginVersion = "0.5.0"
 	modelPrefix   = "cline-pass/"
 
 	failThresholdDefault = 2  // 连续失败多少次后触发 fallback
@@ -148,8 +149,9 @@ type pluginState struct {
 	FailThreshold int                   `json:"fail_threshold"`  // 连续失败触发阈值
 	FailStreak    int                   `json:"fail_streak"`     // 当前连续失败计数
 	SuccessStreak int                   `json:"success_streak"`  // 自动切换后连续成功计数（满 recoverStreakTarget 恢复主力）
-	ModelRules    map[string][]string   `json:"model_rules,omitempty"` // 模型级规则：裸模型名（尾部 * 通配）-> gateway.only 候选列表
-	LastEvent     *fallbackEvent        `json:"last_event,omitempty"`
+	ModelRules    map[string][]string `json:"model_rules,omitempty"`     // 模型级规则：裸模型名（尾部 * 通配）-> gateway.only 候选列表
+	ModelProviders map[string][]string `json:"model_providers,omitempty"` // 自定义支撑上游列表（面板按钮 + 报错解析结果，覆盖默认预置）
+	LastEvent      *fallbackEvent        `json:"last_event,omitempty"`
 }
 
 var (
@@ -160,6 +162,43 @@ var (
 )
 
 func defaultFallbacks() []string { return []string{"baseten", "togetherai", "fireworks"} }
+
+// 预置模型支撑列表：2026-08-26 实测通过的上游（ClinePass 路由表动态变化，可用「从报错解析」刷新）
+func defaultModelProviders() map[string][]string {
+	return map[string][]string{
+		"glm-5.2": {"baseten", "deepinfra", "digitalocean", "fireworks", "morph", "nebius", "novita", "runware", "togetherai", "wafer", "zai"},
+		"glm-5.3": {"zai"},
+		"kimi-k3": {"togetherai"},
+	}
+}
+
+// mergedModelProviders 合并默认预置与自定义（自定义优先；调用方需持有 mu 读锁）
+func mergedModelProviders() map[string][]string {
+	merged := defaultModelProviders()
+	for m, list := range st.ModelProviders {
+		if len(list) > 0 {
+			merged[m] = list
+		}
+	}
+	return merged
+}
+
+// parseProvidersFromError 从 ClinePass 报错文本解析可用上游列表。
+// 匹配模式：...Available providers are: a, b, c （结尾为引号或文本末尾）
+func parseProvidersFromError(text string) []string {
+	m := regexp.MustCompile(`Available providers are:\s*([^"\n]+?)\s*(?:"|$)`).FindStringSubmatch(text)
+	if len(m) < 2 {
+		return nil
+	}
+	var out []string
+	for _, p := range strings.Split(m[1], ",") {
+		p = strings.Trim(p, " .\x60)")
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
 
 func stateFilePath() string {
 	// 测试/特殊部署可注入路径；默认根据二进制位置推导（plugins 目录下）
@@ -216,6 +255,9 @@ func loadState() {
 	st.LastEvent = saved.LastEvent
 	if len(saved.ModelRules) > 0 {
 		st.ModelRules = saved.ModelRules
+	}
+	if len(saved.ModelProviders) > 0 {
+		st.ModelProviders = saved.ModelProviders
 	}
 }
 
@@ -281,8 +323,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return okEnvelopeJSON(`{"resources":[` +
 			`{"Path":"/home","Menu":"ClinePass 网关","Description":"ClinePass 上游供应商选择与热切换"},` +
 			`{"Path":"/config","Description":"当前网关配置(JSON)"},` +
-			`{"Path":"/switch","Description":"切换上游: ?gateway=baseten[,togetherai]"},` +
-			`{"Path":"/rules","Description":"模型级规则: ?model=gpt-5*&gateway=baseten[,togetherai]（gateway=- 删除）"}` +
+			`{"Path":"/switch","Description":"切换全局上游: ?gateway=baseten[,togetherai]"},` +
+			`{"Path":"/rules","Description":"模型级规则: ?model=gpt-5*&gateway=baseten[,togetherai]（gateway=- 删除）"},` +
+			`{"Path":"/providers","Description":"模型支撑上游列表: ?model=glm-5.2&providers=a,b,c（providers=- 回默认）"},` +
+			`{"Path":"/parse-error","Description":"从报错文本解析可用上游: ?text=<urlencoded>"}` +
 			`]}`)
 	case "management.handle":
 		return handleManagement(request)
@@ -507,6 +551,7 @@ func handleManagement(request []byte) ([]byte, error) {
 			"fail_streak":    st.FailStreak,
 			"success_streak": st.SuccessStreak,
 			"model_rules":    st.ModelRules,
+			"model_providers": mergedModelProviders(),
 			"last_event":     st.LastEvent,
 			"plugin":         pluginName,
 			"version":        pluginVersion,
@@ -547,6 +592,50 @@ func handleManagement(request []byte) ([]byte, error) {
 			"version": pluginVersion,
 		})
 		mu.RUnlock()
+		return jsonResp1(200, body), nil
+	case mr.Method == "GET" && (path == "/providers" || strings.HasSuffix(path, "/providers")):
+		// 模型支撑列表：?model=<name>&providers=<a,b,c> 设置（覆盖）；providers=- 删除自定义条目（回默认预置）
+		if model := strings.TrimSpace(firstQuery(mr.Query, "model")); model != "" {
+			raw := strings.TrimSpace(firstQuery(mr.Query, "providers"))
+			mu.Lock()
+			if raw == "" || raw == "-" {
+				delete(st.ModelProviders, model)
+			} else {
+				parts := strings.Split(raw, ",")
+				gw := make([]string, 0, len(parts))
+				for _, p := range parts {
+					if p = strings.TrimSpace(p); p != "" {
+						gw = append(gw, p)
+					}
+				}
+				if len(gw) > 0 {
+					if st.ModelProviders == nil {
+						st.ModelProviders = map[string][]string{}
+					}
+					st.ModelProviders[model] = gw
+				}
+			}
+			mu.Unlock()
+			if err := persistState(); err != nil {
+				return errEnvelopeResp1(500, "persist failed: "+err.Error()), nil
+			}
+		}
+		mu.RLock()
+		body, _ := json.Marshal(map[string]any{
+			"providers": mergedModelProviders(),
+			"plugin":    pluginName,
+			"version":   pluginVersion,
+		})
+		mu.RUnlock()
+		return jsonResp1(200, body), nil
+	case mr.Method == "GET" && (path == "/parse-error" || strings.HasSuffix(path, "/parse-error")):
+		// 从报错文本解析可用上游：?text=<urlencoded>
+		parsed := parseProvidersFromError(firstQuery(mr.Query, "text"))
+		body, _ := json.Marshal(map[string]any{
+			"providers": parsed,
+			"plugin":    pluginName,
+			"version":   pluginVersion,
+		})
 		return jsonResp1(200, body), nil
 	case mr.Method == "GET" && (path == "/switch" || strings.HasSuffix(path, "/switch")):
 		raw := firstQuery(mr.Query, "gateway")
@@ -766,6 +855,22 @@ code { background: var(--bg-muted); border: 1px solid var(--border); padding: 1p
 .rule-row code { min-width: 150px; }
 .rule-row .gws { display: flex; gap: 4px; flex-wrap: wrap; }
 .del { border: none; background: transparent; color: var(--danger); cursor: pointer; font-size: 16px; padding: 2px 8px; line-height: 1; margin-left: auto; }
+.mcard {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 10px 12px; margin-top: 10px; background: var(--bg);
+}
+.mcard .mhead { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.mcard .mrule { font-size: 12px; color: var(--text-muted); }
+.mcard .mrule b { color: var(--text); }
+.mcard .grid { margin-top: 8px; }
+.mcard .toolbar { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.mcard input[type=text] { min-width: 120px; flex: 1; }
+.mcard .action-btn { padding: 6px 12px; font-size: 12.5px; }
+.small-btn {
+  border: 1px solid var(--border); background: transparent; color: var(--text-muted);
+  border-radius: 8px; padding: 6px 12px; font-size: 12.5px; cursor: pointer;
+}
+.small-btn:hover { color: var(--primary); border-color: var(--primary); }
 </style>
 </head>
 <body>
@@ -790,22 +895,14 @@ code { background: var(--bg-muted); border: 1px solid var(--border); padding: 1p
 </div>
 
 <div class="card">
-  <div style="font-weight:600; margin-bottom:2px">快捷切换（单选）</div>
-  <div class="sub" style="margin-bottom:0">手动切换后自动 fallback 不再干预</div>
-  <div class="grid" id="grid"></div>
+  <div style="font-weight:600; margin-bottom:2px">模型上游（快捷切换）</div>
+  <div class="sub" style="margin-bottom:0">每个模型独立的支持上游列表，点按钮 = 把该模型规则锁定为对应上游（立即生效）；无规则的模型用全局配置；列表可用「从报错解析」刷新</div>
+  <div id="models"></div>
 </div>
 
 <div class="card">
-  <div style="font-weight:600; margin-bottom:8px">自定义候选（逗号分隔，多值 = 候选池）</div>
-  <div class="row">
-    <input id="custom" type="text" placeholder="例如: baseten, togetherai, fireworks">
-    <button class="action-btn" onclick="applyCustom()">应用</button>
-  </div>
-</div>
-
-<div class="card">
-  <div style="font-weight:600; margin-bottom:2px">模型规则（按模型指定上游）</div>
-  <div class="sub" style="margin-bottom:0">无匹配规则的模型用上方全局配置；模型名支持尾部 <code>*</code> 通配（如 <code>gpt-5*</code>），精确匹配优先；单上游 = 严格锁定，多上游 = 候选池动态选优</div>
+  <div style="font-weight:600; margin-bottom:2px">自定义规则（任意模型）</div>
+  <div class="sub" style="margin-bottom:0">模型名支持尾部 <code>*</code> 通配（如 <code>gpt-5*</code>），精确匹配优先；单上游 = 严格锁定，多上游 = 候选池动态选优</div>
   <div id="rules"></div>
   <div class="row" style="margin-top:8px">
     <input id="rule-model" type="text" placeholder="模型名，如 gpt-5.1-codex 或 claude-*">
@@ -820,14 +917,15 @@ code { background: var(--bg-muted); border: 1px solid var(--border); padding: 1p
 </div>
 
 <script>
-const PROVIDERS = ["baseten","digitalocean","fireworks","modal","moonshotai","morph","nebius","togetherai"];
 let current = [];
 let rules = {};
+let providers = {};
 let busy = false;
 
 function $(id) { return document.getElementById(id); }
 function show(msg, ok) { const m = $("msg"); m.textContent = msg; m.className = ok ? "ok" : "err"; }
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':"&amp;",'<':"&lt;",'>':"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+function dedupe(arr) { return arr.filter(function(v, i) { return arr.indexOf(v) === i; }); }
 
 async function api(path) {
   const r = await fetch(path, { cache: "no-store" });
@@ -852,20 +950,94 @@ async function refresh(silent) {
       meta += " · 最近事件: " + e.from + " → " + e.to + "（" + e.reason + " " + e.at + "）";
     }
     $("meta").textContent = meta;
-    $("custom").value = current.join(", ");
     rules = d.model_rules || {};
-    renderGrid();
+    providers = d.model_providers || {};
+    renderModels();
     renderRules();
     if (!silent) show("已刷新", true);
   } catch (e) { if (!silent) show("加载失败: " + e.message, false); }
 }
 
-function renderGrid() {
-  $("grid").innerHTML = PROVIDERS.map(p => {
-    const active = current.length === 1 && current[0] === p;
-    return '<button class="btn'+(active?" active":"")+'" onclick="switchTo(\''+esc(p)+'\')">'+esc(p)+'</button>';
+// ---------- 模型子配置 ----------
+
+function ruleFor(m) { return rules[m] || null; }
+
+function renderModels() {
+  const box = $("models");
+  const keys = Object.keys(providers);
+  if (!keys.length) {
+    box.innerHTML = '<div class="sub" style="margin-top:6px">暂无已配置模型</div>';
+    return;
+  }
+  box.innerHTML = keys.map(m => {
+    const list = providers[m] || [];
+    const cur = ruleFor(m);
+    const state = cur ? '<b>'+esc(cur.join(', '))+'</b>' : '走全局配置';
+    const btns = list.map(p => {
+      const active = cur && cur.indexOf(p) >= 0;
+      return '<button class="btn'+(active?' active':'')+'" onclick="setModelRule(\''+esc(m)+'\',\''+esc(p)+'\')">'+esc(p)+'</button>';
+    }).join("");
+    return '<div class="mcard">' +
+      '<div class="mhead"><b>'+esc(m)+'</b>' +
+      '<span class="mrule">当前规则: '+state+'</span>' +
+      '<button class="del" onclick="delRule(\''+esc(m)+'\')" title="清除规则">×</button></div>' +
+      '<div class="grid">'+btns+'</div>' +
+      '<div class="toolbar">' +
+        '<input type="text" placeholder="自定义上游名" data-m="'+esc(m)+'">' +
+        '<button class="action-btn" onclick="addCustom(\''+esc(m)+'\')">添加</button>' +
+        '<button class="small-btn" onclick="parseError(\''+esc(m)+'\')">从报错解析</button>' +
+      '</div></div>';
   }).join("");
 }
+
+async function setModelRule(m, p) {
+  if (busy) return;
+  busy = true;
+  show("切换中…", true);
+  try {
+    await api("/v0/resource/plugins/cpagw-gateway/rules?model=" + encodeURIComponent(m) + "&gateway=" + encodeURIComponent(p));
+    show("已锁定 " + m + " → " + p, true);
+    refresh(true);
+  } catch (e) { show("切换失败: " + e.message, false); }
+  finally { busy = false; }
+}
+
+async function addCustom(m) {
+  const inp = document.querySelector('input[data-m="'+m+'"]');
+  const v = (inp.value || "").trim();
+  if (!v) { show("请输入上游名称", false); return; }
+  if (busy) return;
+  busy = true;
+  show("保存中…", true);
+  try {
+    const merged = dedupe((providers[m]||[]).concat(v.split(/[,\s]+/).filter(Boolean)));
+    await api("/v0/resource/plugins/cpagw-gateway/providers?model=" + encodeURIComponent(m) + "&providers=" + encodeURIComponent(merged.join(",")));
+    await api("/v0/resource/plugins/cpagw-gateway/rules?model=" + encodeURIComponent(m) + "&gateway=" + encodeURIComponent(merged.join(",")));
+    show("已添加并配置: " + m + " → " + merged.join(", "), true);
+    refresh(true);
+  } catch (e) { show("保存失败: " + e.message, false); }
+  finally { busy = false; }
+}
+
+async function parseError(m) {
+  const text = prompt("粘贴 ClinePass 报错文本（含 Available providers are: ...）：");
+  if (!text) return;
+  if (busy) return;
+  busy = true;
+  show("解析中…", true);
+  try {
+    const d = await api("/v0/resource/plugins/cpagw-gateway/parse-error?text=" + encodeURIComponent(text));
+    const parsed = d.providers || [];
+    if (!parsed.length) { show("未从文本中解析到上游列表，请确认包含 Available providers are: ...", false); return; }
+    const merged = dedupe((providers[m]||[]).concat(parsed));
+    await api("/v0/resource/plugins/cpagw-gateway/providers?model=" + encodeURIComponent(m) + "&providers=" + encodeURIComponent(merged.join(",")));
+    show("解析到 " + parsed.length + " 个上游，已并入 " + m + "（" + merged.join(", ") + "）", true);
+    refresh(true);
+  } catch (e) { show("解析失败: " + e.message, false); }
+  finally { busy = false; }
+}
+
+// ---------- 通用规则 ----------
 
 function renderRules() {
   const box = $("rules");
@@ -902,33 +1074,6 @@ async function delRule(m) {
     show("已删除: " + m, true);
     refresh(true);
   } catch (e) { show("删除失败: " + e.message, false); }
-  finally { busy = false; }
-}
-
-async function switchTo(p) {
-  if (busy) return;
-  busy = true;
-  show("切换中…", true);
-  try {
-    const d = await api("/v0/resource/plugins/cpagw-gateway/switch?gateway=" + encodeURIComponent(p));
-    current = d.gateway || [];
-    show("已切换 → " + current.join(", "), true);
-    refresh(true);
-  } catch (e) { show("切换失败: " + e.message, false); }
-  finally { busy = false; }
-}
-
-async function applyCustom() {
-  const v = $("custom").value.trim();
-  if (!v) { show("请输入上游名称", false); return; }
-  if (busy) return;
-  busy = true;
-  show("应用中…", true);
-  try {
-    const d = await api("/v0/resource/plugins/cpagw-gateway/switch?gateway=" + encodeURIComponent(v));
-    show("已应用 → " + (d.gateway || []).join(", "), true);
-    refresh(true);
-  } catch (e) { show("应用失败: " + e.message, false); }
   finally { busy = false; }
 }
 

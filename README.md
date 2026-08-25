@@ -96,6 +96,21 @@ curl "http://localhost:18317/v0/resource/plugins/cpagw-gateway/rules?model=claud
 - 有规则的模型不参与全局 fail-streak 自动 fallback（上游选择交给规则候选池）
 - 规则持久化在插件状态文件，跨重启保留；CPAMP 面板的「ClinePass 网关」页可直接编辑
 
+### 模型支撑上游列表（v0.5.0）
+
+每个模型一份已知可用上游列表，面板据此渲染快捷切换按钮；内置实测默认（glm-5.2 11 个 / glm-5.3 仅 zai / kimi-k3 togetherai），可自定义覆盖或从报错解析刷新：
+
+```bash
+# 设置/覆盖某模型的支撑列表（逗号分隔；providers=- 删除自定义，回默认预置）
+curl "http://localhost:18317/v0/resource/plugins/cpagw-gateway/providers?model=glm-5.3&providers=zai,wafer"
+curl "http://localhost:18317/v0/resource/plugins/cpagw-gateway/providers?model=glm-5.3&providers=-"
+
+# 从 ClinePass 报错文本解析可用上游（错误体中 Available providers are: ... 就是官方路由表）
+curl "http://localhost:18317/v0/resource/plugins/cpagw-gateway/parse-error?text=...urlencoded..."
+```
+
+面板「模型上游（快捷切换）」卡片：每模型一个子配置，点按钮 = 单值锁定（立即生效）；「自定义上游」输入框添加并生效；「从报错解析」粘贴报错文本自动提取可用列表并入该模型；「×」清除模型规则（回全局配置）。
+
 ### 热切换（无需重启）
 
 ```bash
