@@ -3,14 +3,12 @@
 cpagw - ClinePass 上游网关管理工具（经 cpamp 面板代理操作 CPA 插件）
 
 用法:
-  cpagw list                     # 插件状态 + 当前 gateway 配置
-  cpagw switch baseten           # 切换主力上游（热生效，无需重启）
-  cpagw switch baseten togetherai  # 多值候选池（网关动态选优，不保证顺序）
-  cpagw status                   # 当前配置 + 实测一次请求的路由结果
+  cpagw list                     # 插件状态 + 当前规则/支撑列表
+  cpagw status                   # 当前规则 + 实测一次请求的路由结果
   cpagw test                     # 连续 5 次实测，看路由分布
   cpagw rules                    # 列出模型级规则
   cpagw rules gpt-5* baseten     # 设置规则：模型 -> 上游（多值空格分隔 = 候选池）
-  cpagw rules -d gpt-5*          # 删除规则
+  cpagw rules -d gpt-5*          # 删除规则（恢复 ClinePass 自主路由）
 
 密钥来源（优先级）: 环境变量 CPAMP_KEY > --key 参数 > 本文件默认值
 """
@@ -101,24 +99,6 @@ def cmd_list(args):
     return 0
 
 
-def cmd_switch(args):
-    providers = [a for a in args if not a.startswith("--") and a not in ("switch", "list", "status", "test")]
-    if not providers:
-        print("用法: cpagw switch <provider...>  可选: " + ", ".join(VALID_PROVIDERS))
-        return 1
-    for pv in providers:
-        if pv not in VALID_PROVIDERS:
-            print(f"未知上游: {pv}（可选: {', '.join(VALID_PROVIDERS)}）")
-            return 1
-    key = panel_key(args)
-    out = mgmt("PATCH", f"/v0/management/plugins/{PLUGIN_ID}/config", body={"gateway": providers}, key=key)
-    print(f"已切换 gateway -> {providers}（{out.get('status', 'ok')}）")
-    time.sleep(1)
-    fp = chat_cpa("cline-pass/kimi-k3")
-    print(f"实测:   cline-pass/kimi-k3 -> {fp}")
-    return 0
-
-
 def cmd_status(args):
     key = panel_key(args)
     p = get_plugin(key)
@@ -126,8 +106,8 @@ def cmd_status(args):
         print(f"插件 {PLUGIN_ID} 未找到")
         return 1
     cfg = mgmt("GET", f"/v0/management/plugins/{PLUGIN_ID}/config", key=key)
-    gw = (cfg.get("gateway") or [])
-    print(f"当前 gateway: {gw}")
+    print(f"规则:     {json.dumps(cfg.get('model_rules') or {}, ensure_ascii=False)}")
+    print(f"支撑列表: {json.dumps(cfg.get('model_providers') or {}, ensure_ascii=False)}")
     for m in ["cline-pass/kimi-k3", "cline-pass/glm-5.2"]:
         fp = chat_cpa(m)
         print(f"  实测 {m}: {fp}")
@@ -144,9 +124,9 @@ def cmd_rules(args):
     if not rest:
         rules = (resource(base, key) or {}).get("rules") or {}
         if not rules:
-            print("暂无模型规则（全部模型走全局 gateway）")
+            print("暂无模型规则（全部模型由 ClinePass 自主路由）")
             return 0
-        print("模型规则（优先于全局 gateway）:")
+        print("模型规则（匹配即注入 gateway.only，未匹配请求原样放行）:")
         for m, gws in sorted(rules.items()):
             print(f"  {m:<26} -> {', '.join(gws)}")
         return 0
@@ -174,7 +154,7 @@ def cmd_rules(args):
 def cmd_test(args):
     key = panel_key(args)
     cfg = mgmt("GET", f"/v0/management/plugins/{PLUGIN_ID}/config", key=key)
-    print(f"当前 gateway: {cfg.get('gateway')}")
+    print(f"当前规则: {json.dumps(cfg.get('model_rules') or {}, ensure_ascii=False)}")
     from collections import Counter
     dist = Counter()
     for i in range(5):
@@ -194,8 +174,6 @@ def main():
     cmd = args[0]
     if cmd == "list":
         return cmd_list(args)
-    if cmd == "switch":
-        return cmd_switch(args)
     if cmd == "status":
         return cmd_status(args)
     if cmd == "test":

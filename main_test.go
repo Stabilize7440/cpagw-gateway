@@ -65,7 +65,6 @@ func TestNormalizeRequestModelRules(t *testing.T) {
 	tr := transformRequest{FromFormat: "openai", ToFormat: "openai", Model: "cline-pass/gpt-5.1", Body: body}
 
 	mu.Lock()
-	st.Gateway = []string{"baseten"}
 	st.ModelRules = map[string][]string{"gpt-5.1": {"togetherai"}}
 	mu.Unlock()
 
@@ -104,50 +103,31 @@ func TestNormalizeRequestModelRules(t *testing.T) {
 	if gw := injectedGateways("cline-pass/gpt-5.1"); len(gw) != 1 || gw[0] != "togetherai" {
 		t.Fatalf("rule not applied: %v", gw)
 	}
-	if gw := injectedGateways("cline-pass/claude-4"); len(gw) != 1 || gw[0] != "baseten" {
-		t.Fatalf("global fallback broken: %v", gw)
+	if gw := injectedGateways("cline-pass/claude-4"); gw != nil {
+		t.Fatalf("unruled model must NOT be injected (global override removed): %v", gw)
 	}
 	if gw := injectedGateways("gpt-5.1"); gw != nil {
 		t.Fatal("non cline-pass model must not be injected")
 	}
 }
 
-func TestRequestCompleteSkipsRuledModels(t *testing.T) {
-	orig := statePath
-	statePath = filepath.Join(t.TempDir(), "state.json")
-	defer func() { statePath = orig }()
-
-	rc := requestCompletion{Model: "cline-pass/gpt-5.1", Outcome: "failed", StatusCode: 500, Error: "boom"}
-	raw, _ := json.Marshal(rc)
-
-	mu.Lock()
-	st.Gateway = []string{"baseten"}
-	st.Fallbacks = []string{"baseten", "togetherai"}
-	st.FailThreshold = 2
-	st.FailStreak = 1
-	st.ModelRules = map[string][]string{"gpt-5.1": {"nebius"}}
-	mu.Unlock()
-
-	if _, err := handleRequestComplete(raw); err != nil {
-		t.Fatal(err)
-	}
+func TestRequestCompleteIsNoop(t *testing.T) {
+	raw, _ := json.Marshal(map[string]any{"Model": "cline-pass/gpt-5.1", "Outcome": "failed", "StatusCode": 500, "Error": "boom"})
 	mu.RLock()
-	streak1 := st.FailStreak
+	before, _ := json.Marshal(st.ModelRules)
 	mu.RUnlock()
-	if streak1 != 1 {
-		t.Fatalf("ruled model must not affect global fail streak: %d", streak1)
-	}
-
-	// 无规则模型照常计数（触发阈值切换，验证全局逻辑不受规则影响）
-	rc.Model = "cline-pass/claude-4"
-	raw, _ = json.Marshal(rc)
-	if _, err := handleRequestComplete(raw); err != nil {
+	out, err := handleRequestComplete(raw)
+	if err != nil {
 		t.Fatal(err)
 	}
+	if !strings.Contains(string(out), `"ok":true`) {
+		t.Fatalf("unexpected response: %s", out)
+	}
 	mu.RLock()
-	defer mu.RUnlock()
-	if st.Gateway[0] != "togetherai" || st.FailStreak != 0 {
-		t.Fatalf("non-ruled model should trigger fallback and reset streak: streak=%d gw=%v", st.FailStreak, st.Gateway)
+	after, _ := json.Marshal(st.ModelRules)
+	mu.RUnlock()
+	if string(before) != string(after) {
+		t.Fatal("complete event must not mutate state")
 	}
 }
 
@@ -211,29 +191,28 @@ func TestStatePersistenceKeepsRules(t *testing.T) {
 	}
 	mu.Lock()
 	st.ModelRules = nil
-	st.Gateway = []string{"x"}
 	mu.Unlock()
 	loadState()
 	mu.RLock()
 	rules := st.ModelRules
 	mu.RUnlock()
-	if rules == nil || len(rules["claude-*"]) != 1 || rules["claude-*"][0] != "nebius" {
+	if rules == nil || len(rules["claude-*"] ) != 1 || rules["claude-*"][0] != "nebius" {
 		t.Fatalf("model rules not persisted/reloaded: %v", rules)
 	}
 
-	// 旧格式 state（无 model_rules 字段）兼容
-	legacy := `{"gateway":["baseten"],"source":"state","fallbacks":["baseten","togetherai"],"fail_threshold":2}`
+	// 旧格式 state（含 gateway/source/fallbacks 等已移除字段）兼容：静默忽略
+	legacy := `{"gateway":["baseten"],"source":"state","fallbacks":["baseten","togetherai"],"fail_threshold":2,"model_rules":{"claude-*":["nebius"]}}`
 	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte(legacy), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	loadState()
 	mu.RLock()
 	defer mu.RUnlock()
-	if st.ModelRules != nil {
-		t.Fatal("legacy state should yield nil rules")
+	if st.ModelRules == nil || len(st.ModelRules["claude-*"]) != 1 {
+		t.Fatal("legacy state rules should still load")
 	}
-	if st.Gateway[0] != "baseten" {
-		t.Fatalf("legacy state broken: %v", st.Gateway)
+	if _, exists := st.ModelProviders["glm-5.2"]; exists {
+		t.Fatal("ModelProviders must stay empty until explicitly set")
 	}
 }
 

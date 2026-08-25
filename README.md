@@ -2,7 +2,7 @@
 
 [CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI) 的 ClinePass 上游网关管理插件。
 通过 `request_normalizer` 钩子在请求进入 ClinePass 网关前注入 `providerOptions.gateway.only`，
-实现**上游供应商的指定与热切换**（baseten / togetherai / fireworks / moonshotai / nebius / modal / morph / digitalocean / zai），
+实现**模型级上游指定与热切换**（baseten / togetherai / fireworks / moonshotai / nebius / modal / morph / digitalocean / zai），
 支持**按模型指定不同上游**。
 
 ## 为什么需要它
@@ -13,7 +13,7 @@ ClinePass（api.cline.bot）是 Cline 的订阅网关，同一个模型（如 `c
 - ClinePass 官方文档未公开该参数，客户端一般不会传
 - 切换上游需要改 CPA 配置并重启，很麻烦
 
-本插件自动为所有 `cline-pass/*` 模型注入该参数，并暴露管理 API 支持**秒级热切换**。
+本插件为**有规则**的 `cline-pass/*` 模型注入该参数（无规则请求原样放行，由 ClinePass 自主路由），并暴露管理 API 支持**秒级热切换**。
 
 ## 工作原理
 
@@ -23,7 +23,7 @@ ClinePass（api.cline.bot）是 Cline 的订阅网关，同一个模型（如 `c
                          匹配 model 前缀 "cline-pass/" → 注入 providerOptions.gateway.only
                          查模型级规则 -> 注入 providerOptions.gateway.only
                          有规则：该模型专属上游（单值锁定 / 多值候选池）
-                         无规则：全局上游 + 自动 fallback
+                         无规则：请求原样放行（ClinePass 自主路由）
 ```
 
 - 插件类型：`request_normalizer`（openai→openai 有原生 translator，`TranslateRequest` 钩子不触发，但 `NormalizeRequest` 总会触发）
@@ -78,7 +78,7 @@ docker compose up -d
 
 ### 模型级规则（按模型指定上游）
 
-为不同模型指定专属上游：规则匹配优先于全局配置，未命中规则的模型走全局上游。
+为不同模型指定专属上游：命中规则的模型注入 `gateway.only`，未命中的请求**原样放行**（v0.6.0 起不再有全局覆盖）。
 
 ```bash
 # 设置规则：模型名支持尾部 * 通配（精确匹配优先，长前缀优先）
@@ -91,9 +91,8 @@ curl "http://localhost:18317/v0/resource/plugins/cpagw-gateway/rules"
 curl "http://localhost:18317/v0/resource/plugins/cpagw-gateway/rules?model=claude-*&gateway=-"
 ```
 
-- 规则值：单上游 = 严格锁定；多上游 = 候选池动态选优（同全局语义）
+- 规则值：单上游 = 严格锁定；多上游 = 候选池动态选优
 - 模型名写裸名（不含 `cline-pass/` 前缀），如 `gpt-5.1-codex`、`claude-*`
-- 有规则的模型不参与全局 fail-streak 自动 fallback（上游选择交给规则候选池）
 - 规则持久化在插件状态文件，跨重启保留；CPAMP 面板的「ClinePass 网关」页可直接编辑
 
 ### 模型支撑上游列表（v0.5.0）
@@ -109,32 +108,23 @@ curl "http://localhost:18317/v0/resource/plugins/cpagw-gateway/providers?model=g
 curl "http://localhost:18317/v0/resource/plugins/cpagw-gateway/parse-error?text=...urlencoded..."
 ```
 
-面板「模型上游（快捷切换）」卡片：每模型一个子配置，点按钮 = 单值锁定（立即生效）；「自定义上游」输入框添加并生效；「从报错解析」粘贴报错文本自动提取可用列表并入该模型；「×」清除模型规则（回全局配置）。
+面板「模型上游（快捷切换）」卡片：每模型一个子配置，点按钮 = 单值锁定（立即生效）；「自定义上游」输入框添加并生效；「从报错解析」粘贴报错文本自动提取可用列表并入该模型；「×」清除模型规则（恢复 ClinePass 自主路由）。
 
-### 热切换（无需重启）
-
-```bash
-# 经 cpamp 面板代理（推荐，面板持有 CPA 管理密钥）
-curl -X PATCH http://localhost:18317/v0/management/plugins/cpagw-gateway/config \
-  -H "Authorization: Bearer $CPAMP_KEY" -H "Content-Type: application/json" \
-  -d '{"gateway":["togetherai"]}'
-```
-
-或使用随附的 CLI 工具：
+### 模型规则管理（无需重启）
 
 ```bash
 export CPAMP_KEY=你的面板AdminKey
 export CPA_API_KEY=你的CPA访问key
 
-python3 cpagw.py status                    # 当前配置 + 实测路由
-python3 cpagw.py switch togetherai         # 一键热切换
-python3 cpagw.py switch baseten            # 切回
+python3 cpagw.py status                    # 当前规则 + 实测路由
 python3 cpagw.py test                      # 连续 5 次实测路由分布
 
 python3 cpagw.py rules                     # 列出模型级规则
 python3 cpagw.py rules 'gpt-5*' baseten    # 设置规则（模型名含 * 时加引号防 shell 展开）
 python3 cpagw.py rules kimi-k3 moonshotai togetherai
-python3 cpagw.py rules -d 'gpt-5*'         # 删除规则
+python3 cpagw.py rules -d 'gpt-5*'         # 删除规则（恢复 ClinePass 自主路由）
+
+# 直接操作资源路由（公开免 key）：/v0/resource/plugins/cpagw-gateway/rules?model=xxx&gateway=yyy
 ```
 
 ### 验证路由
@@ -149,6 +139,7 @@ python3 cpagw.py rules -d 'gpt-5*'         # 删除规则
 
 - 上游可用性由 ClinePass 侧动态决定。实测（2026-08-26）：glm-5.3 目前仅 `zai` 可用；kimi-k3 不校验 `only` 值（锁任何名字都放行）但实际恒由 togetherai(Together) 支撑；glm-5.2 的 ClinePass 路由表单为 18 个渠道（错误法枚举）：alibaba / baseten / crusoe / deepinfra / digitalocean / fireworks / friendli / gmicloud / inceptron / morph / nebius / novita / parasail / runware / streamlake / togetherai / wafer / zai，其中 11 个已实测连通。若某上游报 `No available providers match the 'only' filter`，完整错误体的 `Available providers are: ...` 会列出当前可选值（可能新增未知上游名，规则 API 不校验值，可直接使用）
 - ClinePass 网关的 `only` 多值语义是「候选池动态选优」（按实时延迟/健康加权），**不是顺序 fallback**；严格锁定请用单值
+- v0.6.0 起移除全局 gateway 覆盖与自动 fallback（/switch 端点、fallback 链、fail-streak 全部删除）：插件只做「有规则模型注入 only」，无规则请求完全原样放行
 - 插件配置变更通过 CPA 的配置热重载传播，Docker Desktop bind mount 下 Windows 侧直接改文件不触发 inotify，请走管理 API 或重启容器
 - `model_rules` 存入插件状态文件而非 config.yaml：状态文件由插件自身读写，与 CPA 配置热重载无关
 
