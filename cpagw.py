@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-cpagw — ClinePass 上游网关管理工具（经 cpamp 面板代理操作 CPA 插件）
+cpagw - ClinePass 上游网关管理工具（经 cpamp 面板代理操作 CPA 插件）
 
 用法:
   cpagw list                     # 插件状态 + 当前 gateway 配置
@@ -8,6 +8,9 @@ cpagw — ClinePass 上游网关管理工具（经 cpamp 面板代理操作 CPA 
   cpagw switch baseten togetherai  # 多值候选池（网关动态选优，不保证顺序）
   cpagw status                   # 当前配置 + 实测一次请求的路由结果
   cpagw test                     # 连续 5 次实测，看路由分布
+  cpagw rules                    # 列出模型级规则
+  cpagw rules gpt-5* baseten     # 设置规则：模型 -> 上游（多值空格分隔 = 候选池）
+  cpagw rules -d gpt-5*          # 删除规则
 
 密钥来源（优先级）: 环境变量 CPAMP_KEY > --key 参数 > 本文件默认值
 """
@@ -16,6 +19,7 @@ import os
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 
 PANEL = os.environ.get("CPAMP_URL", "http://localhost:18317")
@@ -53,6 +57,16 @@ def get_plugin(key):
         if p["id"] == PLUGIN_ID:
             return p
     return None
+
+
+def resource(path, key=None):
+    """插件资源路由（/v0/resource/...）：CPA 侧公开，key 可选"""
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    req = urllib.request.Request(PANEL + path, method="GET", headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode())
 
 
 def chat_cpa(model, max_tokens=8):
@@ -118,6 +132,43 @@ def cmd_status(args):
     return 0
 
 
+def cmd_rules(args):
+    key = panel_key(args)
+    rest = args[1:]
+    if "--key" in rest:
+        i = rest.index("--key")
+        rest = rest[:i] + rest[i + 2:]
+    base = f"/v0/resource/plugins/{PLUGIN_ID}/rules"
+    if not rest:
+        rules = (resource(base, key) or {}).get("rules") or {}
+        if not rules:
+            print("暂无模型规则（全部模型走全局 gateway）")
+            return 0
+        print("模型规则（优先于全局 gateway）:")
+        for m, gws in sorted(rules.items()):
+            print(f"  {m:<26} -> {', '.join(gws)}")
+        return 0
+    if rest[0] in ("-d", "--del"):
+        if len(rest) != 2:
+            print("用法: cpagw rules -d <model>")
+            return 1
+        resource(f"{base}?model={urllib.parse.quote(rest[1])}&gateway=-", key)
+        print(f"已删除规则: {rest[1]}")
+        return 0
+    if len(rest) < 2:
+        print("用法: cpagw rules <model> <provider...>  |  cpagw rules -d <model>")
+        print("模型名支持尾部 * 通配（精确匹配优先），可选上游: " + ", ".join(VALID_PROVIDERS))
+        return 1
+    model, providers = rest[0], rest[1:]
+    for pv in providers:
+        if pv not in VALID_PROVIDERS:
+            print(f"未知上游: {pv}（可选: {', '.join(VALID_PROVIDERS)}）")
+            return 1
+    resource(f"{base}?model={urllib.parse.quote(model)}&gateway={urllib.parse.quote(','.join(providers))}", key)
+    print(f"已设置规则: {model} -> {', '.join(providers)}")
+    return 0
+
+
 def cmd_test(args):
     key = panel_key(args)
     cfg = mgmt("GET", f"/v0/management/plugins/{PLUGIN_ID}/config", key=key)
@@ -147,6 +198,8 @@ def main():
         return cmd_status(args)
     if cmd == "test":
         return cmd_test(args)
+    if cmd == "rules":
+        return cmd_rules(args)
     print(__doc__)
     return 1
 

@@ -115,6 +115,11 @@ python3 cpagw.py status                    # 当前配置 + 实测路由
 python3 cpagw.py switch togetherai         # 一键热切换
 python3 cpagw.py switch baseten            # 切回
 python3 cpagw.py test                      # 连续 5 次实测路由分布
+
+python3 cpagw.py rules                     # 列出模型级规则
+python3 cpagw.py rules 'gpt-5*' baseten    # 设置规则（模型名含 * 时加引号防 shell 展开）
+python3 cpagw.py rules kimi-k3 moonshotai togetherai
+python3 cpagw.py rules -d 'gpt-5*'         # 删除规则
 ```
 
 ### 验证路由
