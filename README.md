@@ -2,7 +2,8 @@
 
 [CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI) 的 ClinePass 上游网关管理插件。
 通过 `request_normalizer` 钩子在请求进入 ClinePass 网关前注入 `providerOptions.gateway.only`，
-实现**上游供应商的指定与热切换**（baseten / togetherai / fireworks / moonshotai / nebius / modal / morph / digitalocean）。
+实现**上游供应商的指定与热切换**（baseten / togetherai / fireworks / moonshotai / nebius / modal / morph / digitalocean），
+支持**按模型指定不同上游**。
 
 ## 为什么需要它
 
@@ -20,7 +21,9 @@ ClinePass（api.cline.bot）是 Cline 的订阅网关，同一个模型（如 `c
 客户端 → CPA (8317) → [cpagw-gateway 插件] → ClinePass 网关 → 指定上游
                          ↑ request.normalize
                          匹配 model 前缀 "cline-pass/" → 注入 providerOptions.gateway.only
-                         配置来自插件 config（PATCH 热更新）
+                         查模型级规则 -> 注入 providerOptions.gateway.only
+                         有规则：该模型专属上游（单值锁定 / 多值候选池）
+                         无规则：全局上游 + 自动 fallback
 ```
 
 - 插件类型：`request_normalizer`（openai→openai 有原生 translator，`TranslateRequest` 钩子不触发，但 `NormalizeRequest` 总会触发）
@@ -73,6 +76,26 @@ docker compose up -d
 
 ## 使用
 
+### 模型级规则（按模型指定上游）
+
+为不同模型指定专属上游：规则匹配优先于全局配置，未命中规则的模型走全局上游。
+
+```bash
+# 设置规则：模型名支持尾部 * 通配（精确匹配优先，长前缀优先）
+curl "http://localhost:18317/v0/resource/plugins/cpagw-gateway/rules?model=gpt-5.1-codex&gateway=baseten"
+curl "http://localhost:18317/v0/resource/plugins/cpagw-gateway/rules?model=claude-*&gateway=nebius"
+curl "http://localhost:18317/v0/resource/plugins/cpagw-gateway/rules?model=kimi-k3&gateway=moonshotai,togetherai"
+
+# 查看 / 删除
+curl "http://localhost:18317/v0/resource/plugins/cpagw-gateway/rules"
+curl "http://localhost:18317/v0/resource/plugins/cpagw-gateway/rules?model=claude-*&gateway=-"
+```
+
+- 规则值：单上游 = 严格锁定；多上游 = 候选池动态选优（同全局语义）
+- 模型名写裸名（不含 `cline-pass/` 前缀），如 `gpt-5.1-codex`、`claude-*`
+- 有规则的模型不参与全局 fail-streak 自动 fallback（上游选择交给规则候选池）
+- 规则持久化在插件状态文件，跨重启保留；CPAMP 面板的「ClinePass 网关」页可直接编辑
+
 ### 热切换（无需重启）
 
 ```bash
@@ -106,6 +129,7 @@ python3 cpagw.py test                      # 连续 5 次实测路由分布
 
 - ClinePass 网关的 `only` 多值语义是「候选池动态选优」（按实时延迟/健康加权），**不是顺序 fallback**；严格锁定请用单值
 - 插件配置变更通过 CPA 的配置热重载传播，Docker Desktop bind mount 下 Windows 侧直接改文件不触发 inotify，请走管理 API 或重启容器
+- `model_rules` 存入插件状态文件而非 config.yaml：状态文件由插件自身读写，与 CPA 配置热重载无关
 
 ## 兼容性
 

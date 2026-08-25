@@ -72,7 +72,7 @@ const abiVersion uint32 = 1
 
 const (
 	pluginName    = "cpagw-gateway"
-	pluginVersion = "0.3.1"
+	pluginVersion = "0.4.0"
 	modelPrefix   = "cline-pass/"
 
 	failThresholdDefault = 2  // 连续失败多少次后触发 fallback
@@ -142,13 +142,14 @@ type fallbackEvent struct {
 }
 
 type pluginState struct {
-	Gateway       []string       `json:"gateway"`         // providerOptions.gateway.only 当前值（单值锁定）
-	Source        string         `json:"source"`          // state(手动) / auto(自动 fallback) / config / default
-	Fallbacks     []string       `json:"fallbacks"`       // fallback 链：链首为主力
-	FailThreshold int            `json:"fail_threshold"`  // 连续失败触发阈值
-	FailStreak    int            `json:"fail_streak"`     // 当前连续失败计数
-	SuccessStreak int            `json:"success_streak"`  // 自动切换后连续成功计数（满 recoverStreakTarget 恢复主力）
-	LastEvent     *fallbackEvent `json:"last_event,omitempty"`
+	Gateway       []string              `json:"gateway"`         // providerOptions.gateway.only 当前值（单值锁定）
+	Source        string                `json:"source"`          // state(手动) / auto(自动 fallback) / config / default
+	Fallbacks     []string              `json:"fallbacks"`       // fallback 链：链首为主力
+	FailThreshold int                   `json:"fail_threshold"`  // 连续失败触发阈值
+	FailStreak    int                   `json:"fail_streak"`     // 当前连续失败计数
+	SuccessStreak int                   `json:"success_streak"`  // 自动切换后连续成功计数（满 recoverStreakTarget 恢复主力）
+	ModelRules    map[string][]string   `json:"model_rules,omitempty"` // 模型级规则：裸模型名（尾部 * 通配）-> gateway.only 候选列表
+	LastEvent     *fallbackEvent        `json:"last_event,omitempty"`
 }
 
 var (
@@ -161,7 +162,10 @@ var (
 func defaultFallbacks() []string { return []string{"baseten", "togetherai", "fireworks"} }
 
 func stateFilePath() string {
-	// 状态文件放在 plugins 目录下（二进制 /CLIProxyAPI/CLIProxyAPI 的 dirname + plugins/）
+	// 测试/特殊部署可注入路径；默认根据二进制位置推导（plugins 目录下）
+	if statePath != "" {
+		return statePath
+	}
 	exe, err := os.Executable()
 	if err == nil && exe != "" {
 		dir := filepath.Dir(exe)
@@ -210,6 +214,9 @@ func loadState() {
 	st.FailStreak = saved.FailStreak
 	st.SuccessStreak = saved.SuccessStreak
 	st.LastEvent = saved.LastEvent
+	if len(saved.ModelRules) > 0 {
+		st.ModelRules = saved.ModelRules
+	}
 }
 
 func persistState() error {
@@ -274,13 +281,41 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return okEnvelopeJSON(`{"resources":[` +
 			`{"Path":"/home","Menu":"ClinePass 网关","Description":"ClinePass 上游供应商选择与热切换"},` +
 			`{"Path":"/config","Description":"当前网关配置(JSON)"},` +
-			`{"Path":"/switch","Description":"切换上游: ?gateway=baseten[,togetherai]"}` +
+			`{"Path":"/switch","Description":"切换上游: ?gateway=baseten[,togetherai]"},` +
+			`{"Path":"/rules","Description":"模型级规则: ?model=gpt-5*&gateway=baseten[,togetherai]（gateway=- 删除）"}` +
 			`]}`)
 	case "management.handle":
 		return handleManagement(request)
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
+}
+
+// matchModelRule 查模型级规则：精确匹配优先，其次最长前缀通配（key 以 * 结尾）。
+// 调用方需持有 mu（读或写锁）。
+func matchModelRule(name string) ([]string, bool) {
+	if len(st.ModelRules) == 0 {
+		return nil, false
+	}
+	if gw, ok := st.ModelRules[name]; ok && len(gw) > 0 {
+		return gw, true
+	}
+	bestPrefix := ""
+	var bestRule []string
+	for key, gw := range st.ModelRules {
+		if !strings.HasSuffix(key, "*") || len(gw) == 0 {
+			continue
+		}
+		prefix := strings.TrimSuffix(key, "*")
+		if len(prefix) >= len(bestPrefix) && strings.HasPrefix(name, prefix) {
+			bestPrefix = prefix
+			bestRule = gw
+		}
+	}
+	if bestRule != nil {
+		return bestRule, true
+	}
+	return nil, false
 }
 
 // ---------- request.normalize：注入 providerOptions ----------
@@ -291,12 +326,20 @@ func normalizeRequest(request []byte) ([]byte, error) {
 		return okEnvelopeJSON1(`{"Body":""}`), nil
 	}
 	model := strings.TrimSpace(tr.Model)
+	if !strings.HasPrefix(model, modelPrefix) || len(tr.Body) == 0 {
+		return okEnvelopeJSON1(base64BodyJSON(tr.Body)), nil
+	}
 	mu.RLock()
-	gw := make([]string, len(st.Gateway))
-	copy(gw, st.Gateway)
+	var gw []string
+	if rule, ok := matchModelRule(strings.TrimPrefix(model, modelPrefix)); ok {
+		gw = append(gw, rule...) // 模型级规则优先
+	} else {
+		gw = make([]string, len(st.Gateway))
+		copy(gw, st.Gateway)
+	}
 	mu.RUnlock()
 
-	if !strings.HasPrefix(model, modelPrefix) || len(tr.Body) == 0 || len(gw) == 0 {
+	if len(gw) == 0 {
 		return okEnvelopeJSON1(base64BodyJSON(tr.Body)), nil
 	}
 	var payload map[string]any
@@ -326,6 +369,13 @@ func handleRequestComplete(request []byte) ([]byte, error) {
 	}
 	if !strings.HasPrefix(strings.TrimSpace(rc.Model), modelPrefix) {
 		return okEnvelopeJSON1(`{}`), nil // 只关心 cline-pass 请求
+	}
+	// 有模型级规则的请求：上游选择交给规则候选池（CPA 动态选优），不参与全局 fail-streak
+	mu.RLock()
+	_, ruled := matchModelRule(strings.TrimPrefix(strings.TrimSpace(rc.Model), modelPrefix))
+	mu.RUnlock()
+	if ruled {
+		return okEnvelopeJSON1(`{}`), nil
 	}
 	switch rc.Outcome {
 	case "succeeded":
@@ -456,9 +506,45 @@ func handleManagement(request []byte) ([]byte, error) {
 			"fail_threshold": st.FailThreshold,
 			"fail_streak":    st.FailStreak,
 			"success_streak": st.SuccessStreak,
+			"model_rules":    st.ModelRules,
 			"last_event":     st.LastEvent,
 			"plugin":         pluginName,
 			"version":        pluginVersion,
+		})
+		mu.RUnlock()
+		return jsonResp1(200, body), nil
+	case mr.Method == "GET" && (path == "/rules" || strings.HasSuffix(path, "/rules")):
+		// 模型级规则：?model=<name>&gateway=<a,b> 设置；gateway=- 删除
+		if model := strings.TrimSpace(firstQuery(mr.Query, "model")); model != "" {
+			raw := strings.TrimSpace(firstQuery(mr.Query, "gateway"))
+			mu.Lock()
+			if raw == "" || raw == "-" {
+				delete(st.ModelRules, model)
+			} else {
+				parts := strings.Split(raw, ",")
+				gw := make([]string, 0, len(parts))
+				for _, p := range parts {
+					if p = strings.TrimSpace(p); p != "" {
+						gw = append(gw, p)
+					}
+				}
+				if len(gw) > 0 {
+					if st.ModelRules == nil {
+						st.ModelRules = map[string][]string{}
+					}
+					st.ModelRules[model] = gw
+				}
+			}
+			mu.Unlock()
+			if err := persistState(); err != nil {
+				return errEnvelopeResp1(500, "persist failed: "+err.Error()), nil
+			}
+		}
+		mu.RLock()
+		body, _ := json.Marshal(map[string]any{
+			"rules":   st.ModelRules,
+			"plugin":  pluginName,
+			"version": pluginVersion,
 		})
 		mu.RUnlock()
 		return jsonResp1(200, body), nil
@@ -675,6 +761,11 @@ input[type=text]:focus { outline: none; border-color: var(--primary); }
 #msg { font-size: 12.5px; min-height: 18px; }
 #msg.ok { color: var(--ok); } #msg.err { color: var(--danger); }
 code { background: var(--bg-muted); border: 1px solid var(--border); padding: 1px 6px; border-radius: 5px; font-size: 12px; }
+.rule-row { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.rule-row:last-child { border-bottom: none; }
+.rule-row code { min-width: 150px; }
+.rule-row .gws { display: flex; gap: 4px; flex-wrap: wrap; }
+.del { border: none; background: transparent; color: var(--danger); cursor: pointer; font-size: 16px; padding: 2px 8px; line-height: 1; margin-left: auto; }
 </style>
 </head>
 <body>
@@ -712,6 +803,17 @@ code { background: var(--bg-muted); border: 1px solid var(--border); padding: 1p
   </div>
 </div>
 
+<div class="card">
+  <div style="font-weight:600; margin-bottom:2px">模型规则（按模型指定上游）</div>
+  <div class="sub" style="margin-bottom:0">无匹配规则的模型用上方全局配置；模型名支持尾部 <code>*</code> 通配（如 <code>gpt-5*</code>），精确匹配优先；单上游 = 严格锁定，多上游 = 候选池动态选优</div>
+  <div id="rules"></div>
+  <div class="row" style="margin-top:8px">
+    <input id="rule-model" type="text" placeholder="模型名，如 gpt-5.1-codex 或 claude-*">
+    <input id="rule-gw" type="text" placeholder="上游，如 baseten 或 baseten,togetherai">
+    <button class="action-btn" onclick="addRule()">添加</button>
+  </div>
+</div>
+
 <div class="actions">
   <button class="action-btn ghost" onclick="refresh()">刷新</button>
   <span id="msg"></span>
@@ -720,6 +822,7 @@ code { background: var(--bg-muted); border: 1px solid var(--border); padding: 1p
 <script>
 const PROVIDERS = ["baseten","digitalocean","fireworks","modal","moonshotai","morph","nebius","togetherai"];
 let current = [];
+let rules = {};
 let busy = false;
 
 function $(id) { return document.getElementById(id); }
@@ -750,7 +853,9 @@ async function refresh(silent) {
     }
     $("meta").textContent = meta;
     $("custom").value = current.join(", ");
+    rules = d.model_rules || {};
     renderGrid();
+    renderRules();
     if (!silent) show("已刷新", true);
   } catch (e) { if (!silent) show("加载失败: " + e.message, false); }
 }
@@ -760,6 +865,44 @@ function renderGrid() {
     const active = current.length === 1 && current[0] === p;
     return '<button class="btn'+(active?" active":"")+'" onclick="switchTo(\''+esc(p)+'\')">'+esc(p)+'</button>';
   }).join("");
+}
+
+function renderRules() {
+  const box = $("rules");
+  const keys = Object.keys(rules).sort();
+  if (!keys.length) { box.innerHTML = '<div class="sub" style="margin-top:6px">暂无规则</div>'; return; }
+  box.innerHTML = keys.map(k => {
+    const badges = (rules[k]||[]).map(g => '<span class="badge">'+esc(g)+'</span>').join("");
+    return '<div class="rule-row"><code>'+esc(k)+'</code><span class="gws">'+badges+'</span>' +
+      '<button class="del" data-m="'+esc(k)+'" onclick="delRule(this.dataset.m)" title="删除">×</button></div>';
+  }).join("");
+}
+
+async function addRule() {
+  const m = $("rule-model").value.trim();
+  const g = $("rule-gw").value.trim();
+  if (!m || !g) { show("模型名和上游都要填", false); return; }
+  if (busy) return;
+  busy = true;
+  show("保存中…", true);
+  try {
+    await api("/v0/resource/plugins/cpagw-gateway/rules?model=" + encodeURIComponent(m) + "&gateway=" + encodeURIComponent(g));
+    show("规则已保存: " + m, true);
+    refresh(true);
+  } catch (e) { show("保存失败: " + e.message, false); }
+  finally { busy = false; }
+}
+
+async function delRule(m) {
+  if (busy) return;
+  busy = true;
+  show("删除中…", true);
+  try {
+    await api("/v0/resource/plugins/cpagw-gateway/rules?model=" + encodeURIComponent(m) + "&gateway=-");
+    show("已删除: " + m, true);
+    refresh(true);
+  } catch (e) { show("删除失败: " + e.message, false); }
+  finally { busy = false; }
 }
 
 async function switchTo(p) {
